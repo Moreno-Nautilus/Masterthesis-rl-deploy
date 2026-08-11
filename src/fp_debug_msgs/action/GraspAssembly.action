@@ -1,0 +1,34 @@
+# One assembly step's grasp + transport, executed by the grasp node
+# (grasping, path planning, collision avoidance — grasp node's scope).
+# Contract (2026-07-17): on success the grasp node has ALSO transported the
+# grasped part to its PRE-ASSEMBLY point (the pre-insertion pose, i.e. the
+# last frame of the plan's disassembly path) — the insertion step starts
+# directly from where this action ends.
+#
+# GOAL fields: names/types agreed 2026-07-15.
+# assembly_name follows Fabrica's naming convention: the assembly's directory
+# name under Fabrica-pdz/assets/fabrica (e.g. "beam", "plumbers_block",
+# "cooling_manifold", "duct"). Part ids are Fabrica's numeric part names
+# (the <N>.obj file stems of that assembly), carried as int32.
+# "left"/"right" are from the ROBOT ARMS' perspective (not operator/camera view).
+# The state machine decides the arm assignment; the grasp node just executes.
+string assembly_name
+int32 base_part_id        # the HELD part
+int32 insertion_part_id   # the MOVE part
+string holder_robot       # "left" | "right"
+string inserter_robot     # "left" | "right"
+---
+# RESULT
+bool success
+string error_code         # DRAFT: empty on success; e.g. "PLANNING_FAILED", "GRASP_FAILED", "TRANSPORT_FAILED"
+string message
+# The resulting grasp (agreed 2026-07-17): pose of the grasped (insertion)
+# part relative to the reference frame named in header.frame_id — tentatively
+# the inserter arm's end-effector frame. Combined with the joint states from
+# the robot's joint publisher, this determines the part's pose in any frame
+# via forward kinematics, which is what the insertion step consumes.
+geometry_msgs/PoseStamped grasped_part_pose
+---
+# FEEDBACK — DRAFT (proposed 2026-07-15, not yet agreed with the grasp-node side)
+string phase              # e.g. "PLANNING" | "GRASPING_BASE" | "GRASPING_PART" | "TRANSPORTING"
+float32 progress          # 0..1 within the current phase

@@ -1,0 +1,11 @@
+string assembly_name
+int32 part_id
+string mode
+float32 score
+bool has_bbox
+int32[4] bbox_xyxy
+bool has_mask
+fp_debug_msgs/DebugMaskCrop mask
+geometry_msgs/PoseStamped pose_camera
+geometry_msgs/PoseStamped pose_base
+float32 axis_len_m

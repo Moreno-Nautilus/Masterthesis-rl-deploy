@@ -1,0 +1,52 @@
+# Parameters for the headless MoveIt preinsert planner (right arm = lbr_two / group arm_two).
+# Uses "/**" so it applies regardless of the node's namespace (the node self-namespaces to
+# /lbr_dual_arm_y_gripper). Motion is OFF by default: the CLI defaults to plan-only, and the
+# ~/move_preinsert service is gated behind allow_execute below.
+/**:
+  ros__parameters:
+    # ---- MoveIt / robot wiring ----
+    # Which arm to move: "right" -> group arm_two / tip lbr_two_gripper_tcp,
+    #                    "left"  -> group arm_one / tip lbr_one_gripper_tcp.
+    # (CLI --arm right|left overrides this.) Both arms plan through the SAME move_group; only the
+    # group and tip differ, so only that arm's 7 joints move.
+    arm: right
+    base_frame: base_link                   # URDF root == MoveIt planning frame == perception frame
+    # Leave group_name/tip_link empty to derive them from `arm`; set them to override explicitly.
+    group_name: ""
+    tip_link: ""
+    move_group_action: move_action          # relative -> /<namespace>/move_action
+    joint_states_topic: joint_states        # relative -> /<namespace>/joint_states
+
+    # ---- perception (socket) ----
+    socket_pose_topic: /perception/fp/pose_base/fused/assembly
+    socket_assembly_name: cooling_manifold
+    # -1 accepts ANY part_id (dry-run bring-up only, logs a warning). Set the real socket part_id
+    # before executing so a wrong detection can't drive the arm.
+    socket_part_id: -1
+    socket_timeout_s: 3.0                    # a socket pose older than this is rejected
+
+    # ---- preinsert target ----
+    # Socket pose is ~1 cm off physically -> hover HIGH (conservative) and let the RL policy close
+    # the last centimetre. This is a GLOBAL +z offset in base_link.
+    hover_z_m: 0.15
+    # "current_tcp" keeps whatever orientation the TCP currently has (safe default; the perceived
+    # object orientation is NOT trusted yet). "fixed" uses fixed_orientation_xyzw instead.
+    orientation_mode: current_tcp
+    fixed_orientation_xyzw: [0.0, 0.0, 0.0, 1.0]   # only used when orientation_mode=fixed; set for your rig
+
+    # ---- planning tolerances / conservatism ----
+    position_tolerance_m: 0.01
+    orientation_tolerance_rad: 0.1
+    velocity_scaling: 0.05                   # <= 0.1 required; start slow
+    acceleration_scaling: 0.05
+    planning_time_s: 5.0
+    num_planning_attempts: 10
+    pipeline_id: ompl
+    planner_id: ""
+    tf_timeout_s: 5.0
+    warmup_plan: true                        # plan-only probe to absorb move_group's startup dirty-state window
+
+    # ---- execute gate (service path only) ----
+    # The one-shot CLI --execute path has its own interactive confirmation. The ~/move_preinsert
+    # SERVICE will refuse unless this is true.
+    allow_execute: false
