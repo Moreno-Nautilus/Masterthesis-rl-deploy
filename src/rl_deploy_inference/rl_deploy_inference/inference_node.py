@@ -52,6 +52,20 @@ MODE_POLICY = "policy"
 MODE_RESET_PREINSERT = "reset_preinsert"
 
 
+class _TolerantYamlLoader(yaml.FullLoader):
+    """FullLoader that ignores embedded python-object tags instead of crashing the whole read.
+
+    The training env.yaml embeds python objects (e.g. a builtins.slice) that FullLoader cannot
+    construct; we only need plain scalars/lists from it (image size, frame_stack, clipping range), so
+    map any python/* tag to None rather than failing to size the observation.
+    """
+
+
+_TolerantYamlLoader.add_multi_constructor(
+    "tag:yaml.org,2002:python/", lambda loader, suffix, node: None
+)
+
+
 @dataclass
 class TimedValue:
     value: object | None = None
@@ -207,6 +221,9 @@ class RLDeployInferenceNode(Node):
         self.declare_parameter("socket_pose_type", "debug_pose_item")
         self.declare_parameter("socket_assembly_name", "cooling_manifold")
         self.declare_parameter("socket_part_id", -1)
+        # The fused assembly topic publishes part_id=-1 (whole assembly, not a numbered part). Set this
+        # true to explicitly accept -1 as the intended selector so start_policy/_ready don't block on it.
+        self.declare_parameter("allow_wildcard_part_id", False)
         # Perception reports the tracked CAD's CENTER pose (FoundationPose uses the centred mesh);
         # sim's anchor (fixed_pos_obs_frame) is the target socket OPENING. Offset is measured in the
         # CAD frame and rotated by the perceived orientation (so a lateral hole offset rotates with
@@ -250,6 +267,11 @@ class RLDeployInferenceNode(Node):
         self.declare_parameter("image_width", 224)
         self.declare_parameter("frame_stack", 1)
         self.declare_parameter("depth_far_m", 0.3)
+        # Depth-cleaning A/B test: fill the D405's ~45% no-return holes + median-denoise so the actor's
+        # depth resembles sim's ~clean depth. OFF = parity path. Toggle live? No -- set in the yaml/launch.
+        self.declare_parameter("depth_clean", False)
+        self.declare_parameter("depth_clean_inpaint_radius", 3)
+        self.declare_parameter("depth_clean_median_ksize", 5)
         self.declare_parameter("ft_smoothing_factor", 0.25)
         self.declare_parameter("force_noise_std", 0.0)
 
@@ -281,6 +303,7 @@ class RLDeployInferenceNode(Node):
         self.declare_parameter("ft_force_cap_n", 20.0)
         self.declare_parameter("ft_warn_n", 10.0)
         self.declare_parameter("seat_force_n", 14.0)
+        self.declare_parameter("trial_stop_mode", "manual")
         # Policy-trial stop gates. Geometry is evaluated in the perceived socket frame, where the socket
         # opening is z=0 and the bottom is z=-seat_socket_depth_m. Defaults mirror the sim cooling socket:
         # 17.5 mm depth and a 25%-of-depth seated tolerance (~4.4 mm above bottom).
@@ -311,13 +334,16 @@ class RLDeployInferenceNode(Node):
             "ft_smoothing_factor": float(self.get_parameter("ft_smoothing_factor").value),
             "force_noise_std": float(self.get_parameter("force_noise_std").value),
             "fov_match": bool(self.get_parameter("fov_match").value),
+            "depth_clean": bool(self.get_parameter("depth_clean").value),
+            "depth_clean_inpaint_radius": int(self.get_parameter("depth_clean_inpaint_radius").value),
+            "depth_clean_median_ksize": int(self.get_parameter("depth_clean_median_ksize").value),
         }
         if self.get_parameter("auto_obs_config_from_env_yaml").value:
             path = self._env_config_path()
             if path:
                 try:
                     with open(path, "r", encoding="utf-8") as f:
-                        env_cfg = yaml.load(f, Loader=yaml.FullLoader)
+                        env_cfg = yaml.load(f, Loader=_TolerantYamlLoader)
                     values["image_height"] = int(env_cfg.get("image_height", values["image_height"]))
                     values["image_width"] = int(env_cfg.get("image_width", values["image_width"]))
                     values["image_channels"] = int(env_cfg.get("image_channels", values["image_channels"]))
@@ -537,9 +563,13 @@ class RLDeployInferenceNode(Node):
         if (
             self.get_parameter("socket_pose_type").value == "debug_pose_item"
             and int(self.get_parameter("socket_part_id").value) < 0
+            and not self.get_parameter("allow_wildcard_part_id").value
         ):
             response.success = False
-            response.message = "socket_part_id must be set before starting policy motion."
+            response.message = (
+                "socket_part_id must be set before starting policy motion "
+                "(or set allow_wildcard_part_id:=true to accept the fused topic's -1)."
+            )
             return response
         if self.manual_estop or self.force_cap_latched:
             response.success = False
@@ -668,6 +698,7 @@ class RLDeployInferenceNode(Node):
             self.get_parameter("enable_motion").value
             and self.get_parameter("socket_pose_type").value == "debug_pose_item"
             and int(self.get_parameter("socket_part_id").value) < 0
+            and not self.get_parameter("allow_wildcard_part_id").value
         ):
             return False, "socket_part_id must be set explicitly before motion"
         timeout = float(self.get_parameter("input_timeout_s").value)
@@ -923,39 +954,47 @@ class RLDeployInferenceNode(Node):
             self.force_cap_latched = True
             return TrialStop("failed_force_cap", f"force cap exceeded: {force_norm:.2f} N")
 
-        geom = self._seat_geometry(fingertip_pos, socket_opening_pos, socket_quat)
-        max_overtravel = float(self.get_parameter("trial_max_overtravel_m").value)
-        if geom is not None and max_overtravel > 0.0 and geom.z_above_bottom_m < -max_overtravel:
-            return TrialStop(
-                "failed_overtravel",
-                f"z={geom.z_above_bottom_m:.4f} m below socket bottom limit, xy={geom.xy_error_m:.4f} m",
-            )
-
-        geometry_seated = False
-        if geom is not None:
-            z_tol = float(self.get_parameter("seat_z_tolerance_m").value)
-            xy_tol = float(self.get_parameter("seat_xy_tolerance_m").value)
-            geometry_seated = geom.z_above_bottom_m <= z_tol and (xy_tol <= 0.0 or geom.xy_error_m <= xy_tol)
-            if geometry_seated:
+        # trial_stop_mode gates the GEOMETRY/seat-force success+failure checks. "manual" (bring-up):
+        # only the HARD stops -- force cap (above) + timeout (below) -- apply; the operator judges
+        # seating. This matters because those geometry checks are measured against the perceived socket
+        # ANCHOR, so a ~cm-off FoundationPose anchor otherwise trips failed_overtravel on the first tick
+        # even though the fingertip is physically over the true hole. "auto_seat" re-enables them (only
+        # trustworthy once the anchor is accurate -- e.g. fed the vision-corrected hole).
+        mode = str(self.get_parameter("trial_stop_mode").value).strip().lower()
+        if mode == "auto_seat":
+            geom = self._seat_geometry(fingertip_pos, socket_opening_pos, socket_quat)
+            max_overtravel = float(self.get_parameter("trial_max_overtravel_m").value)
+            if geom is not None and max_overtravel > 0.0 and geom.z_above_bottom_m < -max_overtravel:
                 return TrialStop(
-                    "succeeded_seated",
-                    f"geometry seat: z_above_bottom={geom.z_above_bottom_m:.4f} m, xy={geom.xy_error_m:.4f} m",
-                    seated=True,
+                    "failed_overtravel",
+                    f"z={geom.z_above_bottom_m:.4f} m below socket bottom limit, xy={geom.xy_error_m:.4f} m",
                 )
 
-        if self._depth_roi_seat_trigger():
-            return TrialStop("succeeded_seated", "depth ROI seat trigger", seated=True)
+            geometry_seated = False
+            if geom is not None:
+                z_tol = float(self.get_parameter("seat_z_tolerance_m").value)
+                xy_tol = float(self.get_parameter("seat_xy_tolerance_m").value)
+                geometry_seated = geom.z_above_bottom_m <= z_tol and (xy_tol <= 0.0 or geom.xy_error_m <= xy_tol)
+                if geometry_seated:
+                    return TrialStop(
+                        "succeeded_seated",
+                        f"geometry seat: z_above_bottom={geom.z_above_bottom_m:.4f} m, xy={geom.xy_error_m:.4f} m",
+                        seated=True,
+                    )
 
-        seat_force = float(self.get_parameter("seat_force_n").value)
-        force_trigger = seat_force > 0.0 and force_norm >= seat_force
-        if force_trigger:
-            if self.get_parameter("seat_force_requires_geometry").value and geom is not None and not geometry_seated:
-                return TrialStop(
-                    "failed_early_contact",
-                    f"seat force {force_norm:.2f} N before seated geometry"
-                    f" (z_above_bottom={geom.z_above_bottom_m:.4f} m, xy={geom.xy_error_m:.4f} m)",
-                )
-            return TrialStop("succeeded_seated", f"seat force reached: {force_norm:.2f} N", seated=True)
+            if self._depth_roi_seat_trigger():
+                return TrialStop("succeeded_seated", "depth ROI seat trigger", seated=True)
+
+            seat_force = float(self.get_parameter("seat_force_n").value)
+            force_trigger = seat_force > 0.0 and force_norm >= seat_force
+            if force_trigger:
+                if self.get_parameter("seat_force_requires_geometry").value and geom is not None and not geometry_seated:
+                    return TrialStop(
+                        "failed_early_contact",
+                        f"seat force {force_norm:.2f} N before seated geometry"
+                        f" (z_above_bottom={geom.z_above_bottom_m:.4f} m, xy={geom.xy_error_m:.4f} m)",
+                    )
+                return TrialStop("succeeded_seated", f"seat force reached: {force_norm:.2f} N", seated=True)
 
         timeout_s = float(self.get_parameter("trial_timeout_s").value)
         if timeout_s > 0.0 and self.policy_start_t is not None and (time.monotonic() - self.policy_start_t) > timeout_s:

@@ -1,0 +1,131 @@
+# Parameters for the vision-corrected MoveIt preinsert (hole_align_planner, right arm by default).
+# Applies regardless of node namespace ("/**"). DEBUG is ON and MOTION is OFF by default: the CLI
+# defaults to plan-only, and the ~/move_hole_align service is gated behind allow_execute below.
+/**:
+  ros__parameters:
+    # ---- MoveIt / robot wiring ----
+    arm: right                              # "right" -> arm_two / lbr_two_gripper_tcp / realsense_2
+    base_frame: base_link                   # URDF root == MoveIt planning frame == perception frame
+    group_name: ""                          # "" -> derive from arm
+    tip_link: ""                            # "" -> derive from arm
+    move_group_action: move_action
+    joint_states_topic: joint_states
+
+    # ---- wrist camera (right arm D405 = realsense_2) ----
+    rgb_topic: /realsense_2/camera/color/image_rect
+    depth_topic: /realsense_2/camera/aligned_depth_to_color/image_rect
+    camera_info_topic: /realsense_2/camera/color/camera_info
+    camera_id: ""                           # "" -> derive from arm (realsense_2 / realsense_1)
+    flange_link: ""                         # "" -> derive from arm (lbr_two_link_ee / lbr_one_link_ee)
+    # Calibrated camera-optical -> flange (lbr_link_ee) offset. Same map the vision pipeline uses.
+    extrinsics_yaml: /home/moreno/Masterthesis-vision/config/camera_extrinsics_realsense.yaml
+    img_sync_slop_s: 0.05
+    img_sync_queue: 30
+    frame_timeout_s: 5.0
+
+    # ---- hole detector ----
+    # "contour" (DEFAULT, robust): saturation-mask the coloured part, find dark blobs, keep only ROUND
+    # ones (the cooling FINS are elongated -> rejected), then pair the two sockets by their CAD 60 mm
+    # spacing. "hough" (legacy): HoughCircles -- over-triggers on the fins, kept for comparison only.
+    method: contour
+    # 14 mm = the socket OPENING diameter, measured from CAD cooling_base.obj (inner rim r~=7.0 mm) and
+    # equal to sim CoolingInsert.asset_size. Set 0.0175 to chase the outer counterbore rim instead.
+    hole_diameter_m: 0.014
+    radius_tol_frac: 0.45                    # radius window = predicted_px * (1 +/- this)
+    # CAD cross-check: the two sockets are 60 mm apart (x = +/-30 mm). Flag the pair whose 3D spacing
+    # matches -> uniquely fixes the real sockets with no perception. Set use_socket_pair false to skip.
+    socket_spacing_m: 0.060
+    socket_spacing_tol_m: 0.012
+    use_socket_pair: true
+    # Part segmentation: the base is vividly coloured; the metal table + black gripper are gray -> out.
+    use_saturation_mask: true
+    sat_min: 60                              # HSV S threshold (0..255) for "colourful == part"
+    val_min: 40                              # HSV V threshold; drops the near-black gripper
+    # Dark-blob shape filters (reject the cooling fins by shape, not by tuning).
+    adaptive_block: 51                       # odd; local-darkness neighbourhood
+    adaptive_C: 5                            # higher => only clearly-dark pixels count as a hole
+    morph_open: false                        # OFF: it erodes real socket rims; shape filters reject fins
+    min_circularity: 0.65                    # 4*pi*A/P^2; fins are far from round
+    max_aspect: 1.8                          # bbox long/short; fins are very elongated
+    min_solidity: 0.80                       # area / convex-hull area
+    min_fill: 0.55                           # area / min-enclosing-circle area
+    # A real insertion socket is embedded in the fins; a MOUNTING through-hole sits at the part edge
+    # with the table showing around it. Require the ring outside the hole to be mostly coloured part.
+    require_part_surround: true
+    surround_part_frac: 0.85                 # >=this fraction of the surrounding ring must be part
+    # Legacy Hough knobs (only used when method: hough).
+    hough_dp: 1.2
+    hough_param1: 120.0
+    hough_param2: 18.0
+    blur_ksize: 5                            # odd; median blur before thresholding/Hough
+    detect_on: rgb                           # "rgb" (grayscale) or "depth" (normalized); Hough only
+    depth_valid_min_m: 0.05
+    depth_valid_max_m: 0.60                  # cap to your working distance to drop far false positives
+    # Chosen circle must be within this many px of the projected perception estimate. <=0 disables it.
+    max_center_dist_px: 60.0
+
+    # ---- perception socket (selection + comparison ONLY; never the final target) ----
+    socket_pose_topic: /perception/fp/pose_base/fused/assembly
+    socket_assembly_name: cooling_base
+    socket_part_id: -1
+    socket_timeout_s: 3.0
+    # Which socket opening to aim at, in the perceived CAD frame. RIGHT default; flip x for LEFT.
+    socket_opening_offset_cad_xyz: [0.030, 0.0, 0.0175]
+    # If detection fails, abort (default) rather than silently reverting to the ~1 cm-off perception
+    # opening -- the whole point of this node is the vision correction. Set true only knowingly.
+    fallback_to_perception: false
+
+    # ---- preinsert target (same contract as preinsert_planner) ----
+    # Lower hover than plain preinsert: the vision correction removes most of the ~1 cm lateral error,
+    # so a 6 cm hover is a reasonable handoff height. Raise if you want more RL travel.
+    hover_z_m: 0.06
+    orientation_mode: down                   # "down" | "current_tcp" | "fixed"
+    fixed_orientation_xyzw: [0.0, 0.0, 0.0, 1.0]
+
+    # ---- planning tolerances / conservatism ----
+    position_tolerance_m: 0.005
+    orientation_tolerance_rad: 0.1
+    velocity_scaling: 0.05                    # <= 0.1; start slow
+    acceleration_scaling: 0.05
+    planning_time_s: 5.0
+    num_planning_attempts: 10
+    pipeline_id: ompl
+    planner_id: ""
+    joint_near_current_tolerance_rad: 0.80
+    max_plan_joint_delta_rad: 0.85
+    # Keep the plan near the current branch (safe for a SMALL corrective move from the gross preinsert).
+    # Set false only for a LARGE gross move (e.g. localizing with the other arm's camera).
+    constrain_branch: true
+    tf_timeout_s: 5.0
+    warmup_plan: true
+    warmup_timeout_s: 8.0                     # bounded warmup so a real FAILURE self-diagnoses fast
+    # "local_ik_joint" (DEFAULT): compute a nearby joint target with KDL/DLS from the CURRENT branch,
+    # then plan joint-space -- keeps a small Cartesian correction a small IN-BRANCH move (a plain
+    # pose_goal lets OMPL branch-flip: a ~1 cm correction became a 70 deg swing). Mirrors the gross
+    # preinsert planner. "pose_goal": Cartesian pose goal (branch-flip prone; use if KDL unavailable).
+    target_mode: local_ik_joint
+    robot_description: ""
+    robot_description_service: robot_state_publisher/get_parameters
+    local_ik_max_iters: 120
+    local_ik_damping: 0.1
+    local_ik_joint_step_rad: 0.04
+    local_ik_cart_step_m: 0.025
+    local_ik_rot_step_rad: 0.08
+    local_ik_max_total_delta_rad: 1.20
+    local_ik_joint_goal_tolerance_rad: 0.01
+
+    # ---- corrected-anchor republisher (--republish-anchor) ----
+    # Feeds the VISION-corrected hole to the RL policy as its socket anchor. Point the RL node's
+    # socket_pose_topic at anchor_topic and set socket_opening_offset_cad_xyz:=[0,0,0],
+    # socket_assembly_name:=anchor_assembly_name, socket_part_id:=anchor_part_id.
+    anchor_topic: /rl_deploy/corrected_socket
+    anchor_assembly_name: cooling_base
+    anchor_part_id: 0
+    anchor_publish_hz: 20.0
+
+    # ---- debug ----
+    debug: true                              # write annotated + depth images every run
+    debug_dir: /tmp/hole_align
+
+    # ---- execute gate (service path only; CLI --execute has its own confirmation) ----
+    allow_execute: false

@@ -227,10 +227,56 @@ motion.
 - [ ] `joint_trajectory_controller` active, RL command controller inactive.
 - [ ] For execute: `allow_partial_joints_goal: true` built + relaunched (see above).
 - [ ] Run **dry-run first**; confirm the target/plan report looks right.
+- [ ] **Eyeball the dry-run's first/last joint targets.** A large joint jump for a small Cartesian
+      move = OMPL (RRTConnect) took a redundant-arm detour; re-run/re-plan rather than execute it.
 - [ ] `socket_part_id` set to the real part (not `-1`) before executing.
 - [ ] Hover starts **high** (`0.15 m`) because the socket pose is ~1 cm off; the RL policy closes it.
 
 The planner prints `ROBOT MAY MOVE NOW. Be ready on the physical E-STOP.` before any motion.
+
+---
+
+## Vision-corrected variant: `hole_align_planner` (hover above the DETECTED hole)
+
+`preinsert_planner` hovers above the **perception** socket pose (tracked `cooling_base` CAD centre),
+which is ~1 cm off — enough to defeat the 1 mm-clearance insertion. `hole_align_planner` instead
+**localizes the socket opening directly in the wrist D405 image** and hovers above *that*:
+
+1. Grabs one time-synced RGB-D frame + `CameraInfo`.
+2. Detects the opening with a **Hough-circle** detector sized by the **known 14 mm hole** (measured
+   from CAD `cooling_base.obj` inner rim ≈ 7.0 mm radius; equals sim `CoolingInsert.asset_size`).
+   The opening depth is sampled from the aligned depth image.
+3. Deprojects the circle to a metric 3D point and transforms it to `base_link` via the **live flange
+   pose (TF) ∘ calibrated camera-to-flange extrinsics** (`camera_extrinsics_realsense.yaml`, the same
+   map the vision pipeline uses).
+4. Re-aims the MoveIt preinsert hover at the **detected** hole, planned with the same `MotionCommander`
+   + branch-safety as above.
+
+Perception's socket pose (when available) is used **only** to disambiguate the base's two sockets and
+to reject spurious circles — never as the final target. It also prints the estimate-vs-detected delta.
+
+**Debug-first / dry-run:** debug is **ON** and motion is **OFF** by default. Every run writes
+`holes_<ts>.png` (all circles yellow, the chosen one green, the projected perception estimate as a red
+`+`) and `depth_<ts>.png` to `debug_dir` (default `/tmp/hole_align`), and logs the full geometry, so
+you can inspect a dry run before anything moves.
+
+```bash
+# DRY-RUN (default): detect, plan, dump debug images + report, exit. NEVER moves.
+ros2 run rl_deploy_inference hole_align_planner --arm right \
+  --ros-args --params-file $(ros2 pkg prefix rl_deploy_inference)/share/rl_deploy_inference/config/hole_align.yaml
+
+# EXECUTE: same, then asks you to type MOVE before it moves the arm.
+ros2 run rl_deploy_inference hole_align_planner --arm right --execute --ros-args --params-file <hole_align.yaml>
+
+# Tune detection inline, e.g. looser accumulator / chase the outer counterbore rim:
+ros2 run rl_deploy_inference hole_align_planner --ros-args -p hough_param2:=14.0 -p hole_diameter_m:=0.0175
+```
+
+Same execution prerequisites as `preinsert_planner` (`allow_partial_joints_goal`, active JTC, MoveIt
+sourced). Additional requirements: **OpenCV** (`cv2`, already in the deploy env), the wrist RGB-D +
+`CameraInfo` topics publishing, and the **`extrinsics_yaml`** path valid on the machine you run it on.
+Inspect the dry-run `holes_*.png` and the printed **correction delta** before trusting the target — a
+large delta or a circle on the wrong socket means re-tune the Hough params / `max_center_dist_px`.
 
 ---
 

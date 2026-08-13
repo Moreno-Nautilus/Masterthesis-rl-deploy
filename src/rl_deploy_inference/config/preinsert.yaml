@@ -29,9 +29,9 @@
     # Socket pose is ~1 cm off physically -> hover HIGH (conservative) and let the RL policy close
     # the last centimetre. This is a GLOBAL +z offset in base_link.
     hover_z_m: 0.15
-    # "current_tcp" keeps whatever orientation the TCP currently has (safe default; the perceived
-    # object orientation is NOT trusted yet). "fixed" uses fixed_orientation_xyzw instead.
-    orientation_mode: current_tcp
+    # "down" (default): tool points exactly straight down, yaw closest to the current wrist (minimal
+    # reorientation). "current_tcp": keep current orientation. "fixed": use fixed_orientation_xyzw.
+    orientation_mode: down
     fixed_orientation_xyzw: [0.0, 0.0, 0.0, 1.0]   # only used when orientation_mode=fixed; set for your rig
 
     # ---- planning tolerances / conservatism ----

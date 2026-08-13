@@ -1,0 +1,26 @@
+# Static collision boxes for MoveIt, so preinsert/MoveIt plans AROUND them.
+# Frame: base_link (the planning frame). size = full extents [x, y, z] in metres; pose = box CENTRE.
+#
+# ⚠️ These numbers are STARTING GUESSES from the socket/robot geometry. Measure your real cell and
+# verify in RViz (PlanningScene display) BEFORE trusting them:
+#   - A box that OVERLAPS the robot makes every plan fail "start state in collision".
+#   - A box that overlaps the socket/hover blocks the preinsert itself.
+# Rule of thumb: table TOP just below the socket (socket z ~ -0.007), and don't enclose the arm bases
+# (they sit at x~0, y=+/-0.42); keep the table in the work area in front (x >~ 0.3).
+frame_id: base_link
+boxes:
+  # Work table in front of the robot. top at z=-0.01, from x 0.30..1.20, y -0.70..+0.70.
+  - id: work_table
+    size: [0.90, 1.40, 0.10]
+    pose: [0.75, 0.0, -0.06]
+
+  # The single static ZED (zed2i_1). Pose from camera_extrinsics_realsense.yaml (the RUNTIME map): its
+  # `t` is the ZED position in the active robot's lbr_link_0 = lbr_two_link_0 (RIGHT arm), so base_link
+  # pose = t + [0, +0.42, 0] = [0.2152, -0.4141, 0.2622] + [0, 0.42, 0].
+  # Axis-aligned bounding box (generous, for avoidance). ⚠️ VERIFY in RViz that it sits on the real ZED
+  # and doesn't overlap EITHER arm at rest (an overlap fails all plans "start state in collision").
+  - id: zed2i_1
+    size: [0.25, 0.25, 0.20]
+    pose: [0.2152, 0.0059, 0.2622]
+
+  # The wrist D405s (realsense_1/2) move WITH the arm, so do NOT add them here as static boxes.

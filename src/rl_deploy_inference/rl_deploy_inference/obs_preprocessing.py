@@ -23,6 +23,12 @@ class ObsPreprocessConfig:
     fov_match: bool = True
     sim_focal_length_mm: float = 19.0
     sim_horizontal_aperture_mm: float = 20.955
+    # Depth cleaning (A/B test vs sim's ~clean depth): fill no-return holes (inpaint) + median denoise
+    # so the real D405's ~45% structured dropout resembles sim's ~2%. OFF by default (parity path).
+    depth_clean: bool = False
+    depth_clean_valid_min_m: float = 0.05
+    depth_clean_inpaint_radius: int = 3
+    depth_clean_median_ksize: int = 5   # 0 disables; must be 3 or 5 for float32 medianBlur
 
 
 def _fov_match_crop(
@@ -66,6 +72,35 @@ def _resize_if_needed(image: np.ndarray, height: int, width: int, interpolation:
     return cv2.resize(image, (width, height), interpolation=interpolation)
 
 
+def _clean_depth(depth_m: np.ndarray, cfg: ObsPreprocessConfig) -> np.ndarray:
+    """Fill no-return holes (Telea inpaint) + median-denoise, to approximate sim's clean depth.
+
+    Test-only: the real D405 has ~45% structured dropout; sim trained on ~2%. This fills invalid
+    pixels from neighbours and smooths speckle so the actor's depth channel is in-distribution.
+    NOTE: this INTERPOLATES over the socket void too, so it trades the hole's depth cue for a smooth
+    surface -- the RGB still carries the hole. Metric depth in metres; returns metric depth.
+    """
+    import cv2
+
+    d = depth_m.astype(np.float32).copy()
+    far = float(cfg.depth_far_m)
+    invalid = ~np.isfinite(d) | (d < float(cfg.depth_clean_valid_min_m)) | (d > far)
+    if not invalid.any():
+        pass
+    else:
+        d[invalid] = 0.0
+        d8 = np.clip(d / max(far, 1e-6), 0.0, 1.0)
+        d8 = (d8 * 255.0).astype(np.uint8)
+        mask = invalid.astype(np.uint8) * 255
+        filled = cv2.inpaint(d8, mask, int(cfg.depth_clean_inpaint_radius), cv2.INPAINT_TELEA)
+        d_filled = filled.astype(np.float32) / 255.0 * far
+        d = np.where(invalid, d_filled, d).astype(np.float32)
+    k = int(cfg.depth_clean_median_ksize)
+    if k >= 3 and k % 2 == 1:
+        d = cv2.medianBlur(d, k if k <= 5 else 5)
+    return d
+
+
 def preprocess_rgbd(
     rgb: np.ndarray, depth_m: np.ndarray, cfg: ObsPreprocessConfig, intrinsics: tuple | None = None
 ) -> np.ndarray:
@@ -86,6 +121,9 @@ def preprocess_rgbd(
         raise ValueError(f"depth must be HxW or HxWx1, got {depth.shape}")
 
     rgb, depth = _fov_match_crop(rgb[:, :, :3], depth, cfg, intrinsics)
+
+    if cfg.depth_clean:
+        depth = _clean_depth(depth, cfg)
 
     try:
         import cv2

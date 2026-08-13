@@ -9,10 +9,17 @@ setup(
     data_files=[
         ("share/ament_index/resource_index/packages", [f"resource/{package_name}"]),
         (f"share/{package_name}", ["package.xml"]),
-        (f"share/{package_name}/config", ["config/deploy.yaml", "config/preinsert.yaml"]),
+        (
+            f"share/{package_name}/config",
+            ["config/deploy.yaml", "config/preinsert.yaml", "config/hole_align.yaml"],
+        ),
         (
             f"share/{package_name}/launch",
-            ["launch/deploy_inference.launch.py", "launch/preinsert_planner.launch.py"],
+            [
+                "launch/deploy_inference.launch.py",
+                "launch/preinsert_planner.launch.py",
+                "launch/hole_align_planner.launch.py",
+            ],
         ),
     ],
     install_requires=["setuptools"],
@@ -27,6 +34,7 @@ setup(
             "inference_node = rl_deploy_inference.inference_node:main",
             "obs_parity = rl_deploy_inference.parity_check:main",
             "preinsert_planner = rl_deploy_inference.preinsert_planner:main",
+            "hole_align_planner = rl_deploy_inference.hole_align_planner:main",
         ],
     },
 )

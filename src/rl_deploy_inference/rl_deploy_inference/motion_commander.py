@@ -41,6 +41,7 @@ import rclpy
 from action_msgs.msg import GoalStatus
 from rclpy.action import ActionClient
 from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
 from rclpy.time import Time as RclpyTime
 
 from geometry_msgs.msg import Point, Pose, Quaternion, Vector3
@@ -162,7 +163,10 @@ class MotionCommander:
 
         self._joint_positions: dict[str, float] = {}
         self._joint_lock = threading.Lock()
-        node.create_subscription(JointState, config.joint_states_topic, self._on_joint_state, 10)
+        # best-effort: compatible with both reliable and sensor-QoS joint_states publishers.
+        node.create_subscription(
+            JointState, config.joint_states_topic, self._on_joint_state, qos_profile_sensor_data
+        )
 
         self._client = (
             ActionClient(node, MoveGroup, config.move_group_action) if _MOVEIT_AVAILABLE else None
@@ -295,10 +299,12 @@ class MotionCommander:
             c.joint_constraints.append(jc)
         return c
 
-    def _build_goal(self, goal_constraints: list, plan_only: bool):
+    def _build_goal(self, goal_constraints: list, plan_only: bool, path_constraints=None):
         req = MotionPlanRequest()
         req.group_name = self.cfg.group_name
         req.goal_constraints = goal_constraints
+        if path_constraints is not None:
+            req.path_constraints = path_constraints
         req.num_planning_attempts = int(self.cfg.num_planning_attempts)
         req.allowed_planning_time = float(self.cfg.allowed_planning_time_s)
         req.max_velocity_scaling_factor = float(self.cfg.max_velocity_scaling)
@@ -356,12 +362,19 @@ class MotionCommander:
     def plan_to_pose(
         self, position_xyz: PositionXYZ, quaternion_xyzw: QuaternionXYZW, *,
         position_tolerance_m: float = 0.01, orientation_tolerance_rad: float = 0.1,
+        path_joint_targets: dict[str, float] | None = None,
+        path_joint_tolerance_rad: float | None = None,
         plan_timeout_s: float = 15.0,
     ) -> PlanResult:
         """Plan the tip to a Cartesian pose in ``base_frame``. Never moves the robot."""
         self._require_moveit()
+        path_constraints = None
+        if path_joint_targets and path_joint_tolerance_rad is not None:
+            path_constraints = self._joint_constraints(path_joint_targets, path_joint_tolerance_rad)
+            path_constraints.name = "stay_near_current_joint_branch"
         goal = self._build_goal(
             [self._pose_constraints(position_xyz, quaternion_xyzw, position_tolerance_m, orientation_tolerance_rad)],
+            path_constraints=path_constraints,
             plan_only=True,
         )
         return self._send_and_wait(goal, plan_only=True, timeout_s=plan_timeout_s)
@@ -369,6 +382,8 @@ class MotionCommander:
     def move_to_pose(
         self, position_xyz: PositionXYZ, quaternion_xyzw: QuaternionXYZW, *,
         position_tolerance_m: float = 0.01, orientation_tolerance_rad: float = 0.1,
+        path_joint_targets: dict[str, float] | None = None,
+        path_joint_tolerance_rad: float | None = None,
         exec_timeout_s: float = 120.0,
     ) -> PlanResult:
         """Plan AND execute the tip to a Cartesian pose (MoveIt-native, single arm).
@@ -377,8 +392,13 @@ class MotionCommander:
         that controller must be the ACTIVE one (the RL command controller inactive).
         """
         self._require_moveit()
+        path_constraints = None
+        if path_joint_targets and path_joint_tolerance_rad is not None:
+            path_constraints = self._joint_constraints(path_joint_targets, path_joint_tolerance_rad)
+            path_constraints.name = "stay_near_current_joint_branch"
         goal = self._build_goal(
             [self._pose_constraints(position_xyz, quaternion_xyzw, position_tolerance_m, orientation_tolerance_rad)],
+            path_constraints=path_constraints,
             plan_only=False,
         )
         return self._send_and_wait(goal, plan_only=False, timeout_s=exec_timeout_s)
@@ -398,6 +418,8 @@ class MotionCommander:
     def wait_until_plannable(
         self, position_xyz: PositionXYZ, quaternion_xyzw: QuaternionXYZW, *,
         position_tolerance_m: float = 0.01, orientation_tolerance_rad: float = 0.1,
+        path_joint_targets: dict[str, float] | None = None,
+        path_joint_tolerance_rad: float | None = None,
         timeout_s: float = 30.0, retry_interval_s: float = 1.0,
     ) -> bool:
         """Retry plan-only toward a pose until move_group's current-state monitor is ready.
@@ -416,6 +438,8 @@ class MotionCommander:
                 position_xyz, quaternion_xyzw,
                 position_tolerance_m=position_tolerance_m,
                 orientation_tolerance_rad=orientation_tolerance_rad,
+                path_joint_targets=path_joint_targets,
+                path_joint_tolerance_rad=path_joint_tolerance_rad,
             )
             if res.success:
                 if attempt > 1:
