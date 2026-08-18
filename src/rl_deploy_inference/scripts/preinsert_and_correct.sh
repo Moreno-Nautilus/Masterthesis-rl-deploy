@@ -8,10 +8,10 @@
 # to type MOVE (Ctrl-C or anything else aborts and nothing moves).
 #
 # Usage:
-#   ARM=left  ./preinsert_and_correct.sh      # left arm  (default) -> realsense_1 / lbr_one
-#   ARM=right ./preinsert_and_correct.sh      # right arm           -> realsense_2 / lbr_two
+#   ./preinsert_and_correct.sh                # right arm (default) -> realsense_2 / lbr_two
+#   ARM=left  ./preinsert_and_correct.sh      # left arm            -> realsense_1 / lbr_one
 # Override the hover height (matches the gross preinsert so step 2 is a lateral re-centering):
-#   HOVER_Z=0.063 ARM=left ./preinsert_and_correct.sh
+#   HOVER_Z=0.063 ./preinsert_and_correct.sh
 #
 # Requires (already up from the runbook): hardware.launch.py, move_group.launch.py, the wrist D405,
 # and (optionally) the perception pipeline. SAFETY: A1 mastered, physical e-stop in hand.
@@ -19,7 +19,7 @@
 # NOTE: no `-u` -- the ROS/ament setup.*.sh scripts reference unbound vars (AMENT_PYTHON_EXECUTABLE).
 set -eo pipefail
 
-ARM="${ARM:-left}"
+ARM="${ARM:-right}"
 HOVER_Z="${HOVER_Z:-0.063}"            # gross preinsert hover above the PERCEIVED socket
 CORR_HOVER_Z="${CORR_HOVER_Z:-0.05}"  # corrected preinsert hover above the DETECTED hole (5 cm)
 # Orientation of the tool at preinsert. "fixed" + FIXED_QUAT pins the wrist YAW so the wrist image

@@ -144,6 +144,7 @@ class RLDeployInferenceNode(Node):
         self.flange_pose = TimedValue()
         self.ft_force = TimedValue()
         self.joint_pos = TimedValue()
+        self.joint_effort = TimedValue()
         self.external_torque = TimedValue()
         self.cam_intrinsics: tuple | None = None
 
@@ -152,6 +153,9 @@ class RLDeployInferenceNode(Node):
         self.prev_loop_t: float | None = None
         self.prev_action = np.zeros(5, dtype=np.float32)
         self.last_command_q: np.ndarray | None = None
+        self.ft_baseline = np.zeros(3, dtype=np.float64)
+        self.ft_baseline_captured = False
+        self._ft_baseline_pending = False
         self.manual_estop = False
         self.force_cap_latched = False
         self.seat_detected = False
@@ -181,6 +185,15 @@ class RLDeployInferenceNode(Node):
         self._init_kinematics_once()
         self._setup_ros_io()
 
+        # Pay the cold CUDA/cuDNN cost now, on the MAIN thread, before the control loop starts. The
+        # first actor.act() on a fresh process blocks ~4 s (cuDNN autotuning); every call after is ~6 ms.
+        # The control tick runs inference inline on this same (single) executor thread, so warming here
+        # keeps EVERY live tick fast -> no first-tick stall, no starved subscriptions, smooth 15 Hz.
+        # NOTE: keep this single-threaded. A MultiThreadedExecutor runs the tick on rotating worker
+        # threads, and PyTorch/cuDNN re-pays its ~4 s lazy per-thread init on each new thread -> the tick
+        # becomes ~4 s every time (jerky, 0.27 Hz). Single thread + this warmup is the correct combo.
+        self._warmup_actor()
+
         period = 1.0 / float(self.get_parameter("control_hz").value)
         self.timer = self.create_timer(period, self._control_tick)
         self.get_logger().info(
@@ -188,6 +201,22 @@ class RLDeployInferenceNode(Node):
             + ("ENABLED" if self.get_parameter("enable_motion").value else "DISABLED")
             + f", mode={self.mode}"
         )
+
+    def _warmup_actor(self) -> None:
+        """One throwaway inference so CUDA/cuDNN init happens at startup, not on the first live tick."""
+        try:
+            channels = int(self.obs_cfg.image_channels) * int(self.obs_cfg.frame_stack)
+            dummy_policy = np.zeros(21, dtype=np.float32)
+            dummy_image = np.zeros(
+                (int(self.obs_cfg.image_height), int(self.obs_cfg.image_width), channels),
+                dtype=np.float32,
+            )
+            t0 = time.monotonic()
+            self.actor.act(make_actor_obs(dummy_policy, dummy_image))
+            self.actor.reset()  # drop the recurrent state the warmup advanced (start_policy resets too)
+            self.get_logger().info(f"actor warmup complete in {time.monotonic() - t0:.2f}s (CUDA hot).")
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warn(f"actor warmup skipped ({exc}); first live tick may be slow.")
 
     def _declare_parameters(self) -> None:
         self.declare_parameter("enable_motion", False)
@@ -247,6 +276,7 @@ class RLDeployInferenceNode(Node):
         # Constant base-frame force bias to match sim's gravity-inclusive force_sensor DC (see
         # _contact_force_base). Set to sim's no-contact hover force if the real force is grav-comp'd.
         self.declare_parameter("ft_bias_base_xyz", [0.0, 0.0, 0.0])
+        self.declare_parameter("ft_baseline_on_start", True)
         self.declare_parameter("ft_topic", "/wrist_ft")
         self.declare_parameter("ft_frame", "base")
         self.declare_parameter("estop_topic", "/rl_deploy/e_stop")
@@ -285,6 +315,13 @@ class RLDeployInferenceNode(Node):
         self.declare_parameter("ik_damping", 0.1)
         self.declare_parameter("max_joint_step_rad", 0.010)
         self.declare_parameter("joint_limit_margin_rad", 0.03)
+        # Software Z-compliance (force-limited insertion): OFF by default. When on, the DOWNWARD part of
+        # the target advance is scaled by max(0, 1 - |contact force| / z_force_limit_n), so the rigid FRI
+        # can't drive contact force past ~z_force_limit_n (set near sim's 12 N contact regime). Only the
+        # into-contact push is limited; lateral + retract commands are untouched. Cheap stand-in for real
+        # Cartesian impedance until the FRI is switched to torque mode + a cartesian_impedance_controller.
+        self.declare_parameter("z_force_limit_enable", False)
+        self.declare_parameter("z_force_limit_n", 12.0)
         # Preinsert reset target. "joint" = move to a fixed measured 7-joint pose (needs it set).
         # "socket_hover" = Cartesian: hover preinsert_hover_z_m ABOVE the perceived socket opening
         # (socket estimate + hole offset + hover_z), keeping the current fingertip orientation. Sim
@@ -536,8 +573,16 @@ class RLDeployInferenceNode(Node):
         by_name = {name: pos for name, pos in zip(msg.name, msg.position)}
         if not all(name in by_name for name in self.joint_names):
             return
+        stamp = time.monotonic()
         q = np.array([by_name[name] for name in self.joint_names], dtype=np.float64)
-        self.joint_pos = TimedValue(q, time.monotonic())
+        self.joint_pos = TimedValue(q, stamp)
+        # Measured joint torque (for force_source: arm_measured_torque). On this cell the FRI estimated-F/T
+        # wrench and external_torque are dead, but joint effort is always live, so we estimate the contact
+        # force from it (minus the no-contact baseline) via the Jacobian.
+        if len(msg.effort) == len(msg.name):
+            by_eff = {name: eff for name, eff in zip(msg.name, msg.effort)}
+            tau = np.array([by_eff[name] for name in self.joint_names], dtype=np.float64)
+            self.joint_effort = TimedValue(tau, stamp)
 
     def _on_flange_pose(self, msg: PoseStamped) -> None:
         self.flange_pose = TimedValue(_pose_to_pos_quat_wxyz(msg), time.monotonic())
@@ -545,9 +590,6 @@ class RLDeployInferenceNode(Node):
     def _on_ft(self, msg: WrenchStamped) -> None:
         f = msg.wrench.force
         force = np.array([f.x, f.y, f.z], dtype=np.float64)
-        if self.get_parameter("ft_frame").value == "flange" and self.flange_pose.value is not None:
-            _, q = self.flange_pose.value
-            force = rotmat_from_quat_wxyz(q) @ force
         self.ft_force = TimedValue(force, time.monotonic())
 
     def _on_estop(self, msg: Bool) -> None:
@@ -583,6 +625,9 @@ class RLDeployInferenceNode(Node):
         self.trial_outcome = "running"
         self.frame_stack.reset()
         self.force_smoother.reset()
+        self.ft_baseline[:] = 0.0
+        self.ft_baseline_captured = False
+        self._ft_baseline_pending = bool(self.get_parameter("ft_baseline_on_start").value)
         # The policy is recurrent (LSTM); sim zeroes the hidden state on every episode reset. Do the
         # same here or a fresh insertion starts with stale recurrent memory from the previous run.
         self.actor.reset()
@@ -600,6 +645,7 @@ class RLDeployInferenceNode(Node):
         self.prev_action[:] = 0.0
         self.policy_start_t = None
         self.trial_outcome = "stopped"
+        self._ft_baseline_pending = False
         response.success = True
         response.message = "policy stopped; holding measured joint position."
         self._status(response.message)
@@ -627,6 +673,7 @@ class RLDeployInferenceNode(Node):
         self.prev_action[:] = 0.0
         self.policy_start_t = None
         self.trial_outcome = "reset_preinsert"
+        self._ft_baseline_pending = False
         response.success = True
         response.message = "reset-to-preinsert requested."
         self._status(response.message)
@@ -638,6 +685,7 @@ class RLDeployInferenceNode(Node):
         self.prev_action[:] = 0.0
         self.policy_start_t = None
         self.trial_outcome = ""
+        self._ft_baseline_pending = False
         self.force_smoother.reset()
         self.seat_pub.publish(Bool(data=False))
         response.success = True
@@ -670,12 +718,33 @@ class RLDeployInferenceNode(Node):
         Default: estimate the external end-effector force from the FRI external joint torque,
         ``F = ft_sign * pinv(J^T) tau_ext [0:3]``. Legacy: the WrenchStamped topic value.
         """
-        if self.get_parameter("force_source").value == "wrench_topic":
+        src = self.get_parameter("force_source").value
+        if src == "wrench_topic":
             force = np.asarray(self.ft_force.value, dtype=np.float64).reshape(3)
+            if self.get_parameter("ft_frame").value == "flange":
+                _, q = self.flange_pose.value
+                force = rotmat_from_quat_wxyz(q) @ force
+        elif src == "arm_measured_torque":
+            # Contact force from MEASURED joint torque via the Jacobian. Gravity/friction are removed by
+            # the no-contact baseline captured at start (subtracted below), since the arm is quasi-static.
+            tau = np.asarray(self.joint_effort.value, dtype=np.float64).reshape(7)
+            sign = float(self.get_parameter("ft_sign").value)
+            force = sign * wrench_from_external_torque(jac, tau)[0:3]
         else:
             tau_ext = np.asarray(self.external_torque.value, dtype=np.float64).reshape(7)
             sign = float(self.get_parameter("ft_sign").value)
             force = sign * wrench_from_external_torque(jac, tau_ext)[0:3]
+        force = np.nan_to_num(force, nan=0.0, posinf=0.0, neginf=0.0)
+        if self._ft_baseline_pending:
+            self.ft_baseline = force.copy()
+            self.ft_baseline_captured = True
+            self._ft_baseline_pending = False
+            self.get_logger().warn(
+                "captured no-contact F/T baseline (base frame): "
+                f"[{self.ft_baseline[0]:.3f}, {self.ft_baseline[1]:.3f}, {self.ft_baseline[2]:.3f}] N"
+            )
+        if bool(self.get_parameter("ft_baseline_on_start").value) and self.ft_baseline_captured:
+            force = force - self.ft_baseline
         # Sim's force_sensor sits above the gripper -> it INCLUDES the constant distal-weight term
         # (gripper+screw), world frame. If the real force is gravity/payload-compensated, add it back
         # here so the DC matches sim (measure it as sim's no-contact hover force). Default 0 = no bias.
@@ -710,8 +779,13 @@ class RLDeployInferenceNode(Node):
         ]
         if self.get_parameter("fingertip_source").value == "flange_pose":
             checks.append((self.flange_pose.fresh(timeout), "flange_pose"))
-        if self.get_parameter("force_source").value == "wrench_topic":
+        _fsrc = self.get_parameter("force_source").value
+        if _fsrc == "wrench_topic":
             checks.append((self.ft_force.fresh(timeout), "ft"))
+            if self.get_parameter("ft_frame").value == "flange":
+                checks.append((self.flange_pose.fresh(timeout), "flange_pose"))
+        elif _fsrc == "arm_measured_torque":
+            checks.append((self.joint_effort.fresh(timeout), "joint_effort"))
         else:
             checks.append((self.external_torque.fresh(timeout), "external_torque"))
         missing = [name for ok, name in checks if not ok]
@@ -758,11 +832,6 @@ class RLDeployInferenceNode(Node):
             ee_angvel = _finite_diff_angvel(self.prev_ft_quat, fingertip_quat, dt).astype(np.float32)
         self.prev_ft_pos = fingertip_pos.copy()
         self.prev_ft_quat = fingertip_quat.copy()
-        # SIM PARITY (non-negotiable): Forge zeroes the roll/pitch angular-velocity channels every
-        # step (forge_env._compute_intermediate_values: `self.ee_angvel_fd[:, 0:2] = 0.0`), and the
-        # E2E env inherits that unchanged, so the trained policy only ever saw ee_angvel = [0, 0, wz].
-        # Leaving the real roll/pitch rates in makes two of the 21 obs dims out-of-distribution.
-        ee_angvel[0:2] = 0.0
 
         ft_smooth = self.force_smoother.update(self._contact_force_base(jac))
         force_norm = float(np.linalg.norm(ft_smooth))
@@ -819,6 +888,17 @@ class RLDeployInferenceNode(Node):
             rot_scale=float(self.get_parameter("e2e_rot_action_scale").value),
             socket_action_bound=float(self.get_parameter("socket_action_bound").value),
         )
+        # Software Z-compliance: throttle the DOWNWARD (into-contact) target advance as contact force
+        # rises toward z_force_limit_n, so the rigid FRI can't spike force past it. Sign-robust (uses
+        # |F|); only reduces the downward push (lateral + retract untouched). OFF unless enabled.
+        if self.get_parameter("z_force_limit_enable").value:
+            limit = float(self.get_parameter("z_force_limit_n").value)
+            atten = float(np.clip(1.0 - force_norm / max(limit, 1e-6), 0.0, 1.0))
+            target_pos = np.asarray(target_pos, dtype=np.float64).copy()
+            dz = float(target_pos[2]) - float(fingertip_pos[2])
+            if dz < 0.0:  # commanding downward (insertion) -> attenuate by contact force
+                target_pos[2] = float(fingertip_pos[2]) + dz * atten
+
         delta_pose = get_pose_error(fingertip_pos, fingertip_quat, target_pos, target_quat)
         dq = get_delta_dof_pos(delta_pose, jac, damping=float(self.get_parameter("ik_damping").value))
         q_cmd = self._limit_command(q, q + dq)
@@ -872,9 +952,10 @@ class RLDeployInferenceNode(Node):
             return
         jac = self.kinematics.jacobian(q)
         timeout = float(self.get_parameter("input_timeout_s").value)
+        _fsrc = self.get_parameter("force_source").value
         force_fresh = (
-            self.ft_force.fresh(timeout)
-            if self.get_parameter("force_source").value == "wrench_topic"
+            self.ft_force.fresh(timeout) if _fsrc == "wrench_topic"
+            else self.joint_effort.fresh(timeout) if _fsrc == "arm_measured_torque"
             else self.external_torque.fresh(timeout)
         )
         if force_fresh:
@@ -1034,6 +1115,9 @@ class RLDeployInferenceNode(Node):
 def main(args: list[str] | None = None) -> None:
     rclpy.init(args=args)
     node = RLDeployInferenceNode()
+    # Single-threaded on purpose: the control tick runs inference inline on this thread, which the
+    # init-time warmup keeps hot (~6 ms/tick). A MultiThreadedExecutor would move the tick onto rotating
+    # worker threads and re-pay PyTorch's ~4 s cuDNN per-thread init every tick. See _warmup_actor().
     try:
         rclpy.spin(node)
     finally:

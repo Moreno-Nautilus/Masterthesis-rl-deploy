@@ -6,16 +6,10 @@ rl_deploy_inference:
     stream_hold_when_disabled: true
     control_hz: 15.0
 
-    # DEPLOY WINNER: w2_estimator_192 = the explicit-estimator policy (83.2% @ full +/-2.5cm socket
-    # noise, vs 67.8% without the estimator). Same E2E visuomotor policy as e2e_weld_curric PLUS an
-    # internal vision estimator head that localizes the hole from the wrist image and feeds it into the
-    # policy. Two structural facts vs e2e_weld_curric: (1) the agent.yaml lists a privileged `aux_label`
-    # obs group + an `aux_head` -> policy.py auto-declares aux_label in the obs space and feeds dummy
-    # zeros (it has zero effect on the action; see policy.py). (2) w2 was trained with GRAVITY
-    # COMPENSATION, so ft_bias_base_xyz MUST stay 0 (below) -- feed pure contact force, do not re-add a
-    # gravity DC. The ep2000 checkpoint (rew 162.14) is the reported 83.2% winner.
-    policy_checkpoint: /home/moreno/Masterthesis-rl-train/logs/rl_games/Forge/w2_estimator_192/nn/last_Forge_ep_2000_rew_162.13815.pth
-    agent_config: /home/moreno/Masterthesis-rl-train/logs/rl_games/Forge/w2_estimator_192/params/agent.yaml
+    # Right-arm afternoon policy A (plain E2E, no aux/estimator). If it does not load, launch again with
+    # the B checkpoint noted in the run instructions.
+    policy_checkpoint: /home/moreno/Masterthesis-rl-train/logs/rl_games/Forge/e2e_deploy_hard_a175_bimodal_2500/nn/last_Forge_ep_2000_rew_160.34671.pth
+    agent_config: /home/moreno/Masterthesis-rl-train/logs/rl_games/Forge/e2e_deploy_hard_a175_bimodal_2500/params/agent.yaml
     train_repo: /home/moreno/Masterthesis-rl-train
     env_config: ""
     auto_obs_config_from_env_yaml: true
@@ -33,50 +27,45 @@ rl_deploy_inference:
     # Crop the real (wide) D405 view to the sim pinhole FOV (~57.7 deg) before the 224 resize.
     fov_match: true
 
-    # FoundationPose/fusion socket anchor. Orientation is intentionally ignored by the policy.
-    socket_pose_topic: /perception/fp/pose_base/fused/assembly
+    # Corrected CV hole anchor. This same position feeds policy[0:3] and the action box center.
+    socket_pose_topic: /rl_deploy/corrected_socket
     socket_pose_type: debug_pose_item
     socket_assembly_name: cooling_base
-    socket_part_id: -1
-    # Perception gives the tracked CAD CENTER (cooling_base); sim's anchor is the target socket OPENING.
-    # Offset is in the CAD frame and rotated by the perceived orientation. cooling_base is symmetric
-    # about its centre -> openings at RIGHT [0.030, 0.0, 0.0175], LEFT [-0.030, 0.0, 0.0175] m.
-    # Default = RIGHT socket; flip the x sign for the LEFT socket.
-    socket_opening_offset_cad_xyz: [0.030, 0.0, 0.0175]
-    # Socket anchor policy. "frozen" (SIM-FAITHFUL, recommended): latch the perceived socket ONCE at
-    # /rl_deploy/start_policy and hold it for the whole trial (sim's anchor is static per episode; the
-    # wrist cam is occluded by the gripper/screw mid-insertion, and w2's internal estimator refines the
-    # hole from the image every frame anyway). Re-capture by re-hovering + calling start_policy again.
+    socket_part_id: 0
+    socket_opening_offset_cad_xyz: [0.0, 0.0, 0.0]
+    # The corrected-anchor republisher captures the CV hole once and republishes it during the trial.
+    # Re-capture by re-hovering and restarting that republisher before start_policy.
     # "live" = track the latest perceived pose every tick.
     socket_anchor_mode: frozen
 
     # KUKA/Fri bridge. Override names if launching in a namespace.
     lbr_state_topic: state
-    joint_state_topic: /lbr_dual_arm/joint_states
-    lbr_command_topic: command/joint_position
+    joint_state_topic: /lbr_dual_arm_y_gripper/joint_states
+    lbr_command_topic: /rl_deploy/command_15hz
     flange_pose_topic: /right/ee_pose
     # Fingertip pose from KDL FK(q) to tip_link=gripper_tcp (matches sim). "flange_pose" = legacy.
     fingertip_source: fk
     robot_prefix: lbr_two
-    base_link: lbr_two_link_0
+    base_link: base_link
     tip_link: lbr_two_gripper_tcp
     fallback_tip_link: lbr_two_link_ee
     flange_to_fingertip_xyz: [0.0, 0.0, 0.1463]
     flange_to_fingertip_quat_wxyz: [1.0, 0.0, 0.0, 0.0]
     robot_description: ""
-    robot_description_service: /lbr_dual_arm/robot_state_publisher/get_parameters
+    robot_description_service: /lbr_dual_arm_y_gripper/robot_state_publisher/get_parameters
 
-    # No wrist F/T sensor: estimate the contact force from the FRI external joint torque via
-    # pinv(J^T). VALIDATE ft_sign (and any DC offset) with a press-test vs sim before enabling motion.
-    force_source: arm_external_torque
-    ft_sign: 1.0
-    # GRAVITY COMPENSATION (w2_estimator_192): w2 was trained with the constant gravity/payload wrench
-    # REMOVED, so its ft_force obs is PURE CONTACT force. Keep this at 0 and feed the robot's
-    # gravity/payload-compensated F/T directly -- do NOT re-add a gravity DC. (This differs from
-    # e2e_weld_curric, whose force_sensor included the distal weight; w2 closes that sim2real gap.)
+    # Wrist F/T broadcaster. The node captures and subtracts a no-contact baseline at start_policy.
+    # estimated_ft_sensor wrench is DEAD on this cell (verified: 0.0 N under a 22 Nm hand press), and
+    # /state external_torque isn't reliably published -> use the always-live MEASURED joint torque and
+    # estimate the contact force from it via the Jacobian (gravity removed by the start baseline).
+    force_source: arm_measured_torque
+    # arm_measured_torque gives the force the ARM EXERTS; sim's force_sensor reads the force ON the tip
+    # (Newton's 3rd-law opposite), so flip to match sim's convention (socket resisting insertion -> +z).
+    ft_sign: -1.0
     ft_bias_base_xyz: [0.0, 0.0, 0.0]
-    ft_topic: /wrist_ft
-    ft_frame: base
+    ft_baseline_on_start: true
+    ft_topic: /lbr_dual_arm_y_gripper/force_torque_broadcaster/wrench
+    ft_frame: flange
     estop_topic: /rl_deploy/e_stop
 
     # Byte-match the sim preprocessing path with deploy DR/noise off.
@@ -92,15 +81,18 @@ rl_deploy_inference:
     # (no smoothing) is far outside that range and makes the applied action AND the prev_action obs
     # out-of-distribution. Keep this within [0.025, 0.1]; lower = gentler/heavier smoothing.
     ema_factor: 0.0625
-    # PARITY (verified): w2_estimator_192 is trained with e2e_pos_action_scale 0.01 (all *deploy* runs
-    # are), so 0.01 is exact for the checkpoint you will run. rot_scale 0.1 rad, socket-anchored clip
-    # +/-0.08 m, EMA in [0.025, 0.1] -- all unchanged from the E2E action contract.
     e2e_pos_action_scale: 0.01
     e2e_rot_action_scale: 0.1
-    socket_action_bound: 0.08
+    socket_action_bound: 0.05
     ik_damping: 0.1
-    max_joint_step_rad: 0.010
+    max_joint_step_rad: 0.0045
     joint_limit_margin_rad: 0.03
+    # Software Z-compliance (force-limited insertion). OFF by default. When true, the downward push is
+    # scaled by max(0, 1 - |contact force|/z_force_limit_n) so the rigid FRI can't spike contact force
+    # past ~z_force_limit_n (near sim's 12N regime) -- a cheap stand-in for real Cartesian impedance.
+    # Enable it live to test:  ros2 param set /rl_deploy_inference z_force_limit_enable true
+    z_force_limit_enable: false
+    z_force_limit_n: 6.0
 
     # Preinsert reset target. "socket_hover" = hover preinsert_hover_z_m above the perceived socket
     # opening (no hand-measured joint pose needed); "joint" = fixed 7-joint pose. socket_hover needs a
@@ -117,7 +109,7 @@ rl_deploy_inference:
     # Safeguards and seating behavior.
     input_timeout_s: 0.35
     socket_timeout_s: 0.75
-    ft_force_cap_n: 20.0
+    ft_force_cap_n: 25.0
     ft_warn_n: 10.0
     seat_force_n: 14.0
     # First hardware runs: let the policy use the noisy socket estimate, but do NOT let that same
@@ -140,5 +132,5 @@ rl_deploy_inference:
     gripper_open_topic: /gripper/open_cmd
     gripper_open_value: 0.04
 
-    publish_debug_obs: false
+    publish_debug_obs: true
     obs_dump_path: ""

@@ -474,6 +474,10 @@ class HoleAlignPlanner(Node):
 
         # Report the correction vs the perception estimate.
         self.get_logger().info(f"DETECTED hole (base_link): pos={_fmt_xyz(hole_base)}")
+        # Remember this detection (taken from the clean, pre-descent view) so --republish-anchor can
+        # reuse it instead of a SECOND CV detection at the 4.5 cm hover, where the centered screw
+        # occludes/shifts the hole and gives a several-cm-off anchor.
+        self._executed_hole_base = np.asarray(hole_base, dtype=np.float64).reshape(3)
         if expected_opening_base is not None:
             delta = hole_base - expected_opening_base
             self.get_logger().info(
@@ -571,6 +575,10 @@ class HoleAlignPlanner(Node):
                     "Pass the corrected-preinsert 'DETECTED hole (base_link)' via -p anchor_xyz:=\"[x, y, z]\"."
                 )
                 return False
+        return self._spin_publish_anchor(hole)
+
+    def _spin_publish_anchor(self, hole) -> bool:
+        """Publish a fixed base_link hole as the RL socket anchor at anchor_publish_hz until Ctrl-C."""
         topic = self.get_parameter("anchor_topic").value
         assembly = self.get_parameter("anchor_assembly_name").value
         part_id = int(self.get_parameter("anchor_part_id").value)
@@ -954,7 +962,7 @@ def main(args: list[str] | None = None) -> None:
             rclpy.shutdown()
         return
 
-    if cli.republish_anchor:
+    if cli.republish_anchor and not cli.execute:
         node = HoleAlignPlanner(namespace=namespace, background=False, arm_override=cli.arm)
         try:
             node.run_republish_anchor()
@@ -972,7 +980,20 @@ def main(args: list[str] | None = None) -> None:
                 node.get_logger().warn("execute not confirmed; staying in plan-only. Nothing moved.")
                 execute = False
         if execute:
-            node.run(execute=True)
+            res = node.run(execute=True)
+            if cli.republish_anchor:
+                # Reuse the hole detected DURING the gross move (clean ~15 cm view) as the anchor -- do
+                # NOT re-detect at the 4.5 cm hover, where the centered screw occludes/shifts it.
+                hole = getattr(node, "_executed_hole_base", None)
+                if res.success and res.moved and hole is not None:
+                    node.get_logger().warn(
+                        "republishing the DETECTED hole from the gross move as the anchor (no re-detection)."
+                    )
+                    node._spin_publish_anchor(hole)  # blocks until Ctrl-C
+                else:
+                    node.get_logger().error(
+                        "NOT republishing anchor: execute did not move, or no hole was detected."
+                    )
         elif not cli.execute:
             node.run(execute=False)
     finally:
