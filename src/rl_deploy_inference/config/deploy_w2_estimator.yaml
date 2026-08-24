@@ -1,0 +1,157 @@
+rl_deploy_inference:
+  ros__parameters:
+    # ------------------------------------------------------------------------------------------------
+    # EXPLICIT-ESTIMATOR deploy config (w2_estimator_192).
+    #
+    # Same E2E insertion policy as the plain-E2E deploy.yaml, PLUS an internal vision estimator head:
+    # an `aux_head` predicts the hole gap from the wrist image and (via `feed_to_policy: [hole]`) feeds
+    # that PREDICTION back into the policy input. 83.2% @ full +/-2.5 cm socket noise vs 67.8% without.
+    #
+    # NO node code changes are needed to run it: policy.py auto-detects the aux_head/aux_label in the
+    # agent.yaml, declares the privileged `aux_label` obs group, and feeds dummy zeros each step (the
+    # label is training-only; the fed-to-policy value is the head's own image-derived prediction, so the
+    # zeros have zero effect on the action). This file just points the loader at the w2 checkpoint.
+    #
+    # Run:  ros2 launch rl_deploy_inference deploy_inference.launch.py \
+    #         params_file:=$(ros2 pkg prefix rl_deploy_inference)/share/rl_deploy_inference/config/deploy_w2_estimator.yaml
+    # (or use the convenience deploy_inference_w2_estimator.launch.py, which defaults to this file.)
+    #
+    # Everything below is identical to deploy.yaml EXCEPT policy_checkpoint + agent_config. Keep the two
+    # files in sync when tuning shared safety/obs params.
+    # ------------------------------------------------------------------------------------------------
+
+    # Fail-closed by default. Set true only after obs parity and dry-run checks pass.
+    enable_motion: false
+    policy_active_on_start: false
+    stream_hold_when_disabled: true
+    control_hz: 15.0
+
+    # DEPLOYED WINNER: explicit-estimator policy. Gravity-comp trained -> ft_force is pure contact force,
+    # so ft_bias stays [0,0,0] (below). env.yaml is auto-loaded from the params/ dir next to agent_config
+    # for obs sizing + FOV-crop intrinsics, so env_config can stay "".
+    policy_checkpoint: /home/moreno/Masterthesis-rl-train/logs/rl_games/Forge/w2_estimator_192/nn/last_Forge_ep_2000_rew_162.13815.pth
+    agent_config: /home/moreno/Masterthesis-rl-train/logs/rl_games/Forge/w2_estimator_192/params/agent.yaml
+    train_repo: /home/moreno/Masterthesis-rl-train
+    env_config: ""
+    auto_obs_config_from_env_yaml: true
+    policy_device: cuda:0
+    deterministic_policy: true
+
+    # One-arm deploy default: RIGHT arm + D405 "realsense_2".
+    # realsense_1 is the left-arm D405; realsense_2 is the right-arm D405.
+    rgb_topic: /realsense_2/camera/color/image_rect
+    depth_topic: /realsense_2/camera/aligned_depth_to_color/image_rect
+    rgb_camera_info_topic: /realsense_2/camera/color/camera_info
+    # Sync the RGB + aligned-depth pair on header stamp (both carry one). FRI/socket use latest.
+    img_sync_slop_s: 0.02
+    img_sync_queue: 30
+    # Crop the real (wide) D405 view to the sim pinhole FOV (~57.7 deg) before the 224 resize.
+    fov_match: true
+
+    # Corrected CV hole anchor. This same position feeds policy[0:3] and the action box center.
+    socket_pose_topic: /rl_deploy/corrected_socket
+    socket_pose_type: debug_pose_item
+    socket_assembly_name: cooling_base
+    socket_part_id: 0
+    socket_opening_offset_cad_xyz: [0.0, 0.0, 0.0]
+    # The corrected-anchor republisher captures the CV hole once and republishes it during the trial.
+    # Re-capture by re-hovering and restarting that republisher before start_policy.
+    # "live" = track the latest perceived pose every tick.
+    socket_anchor_mode: frozen
+
+    # KUKA/Fri bridge. Override names if launching in a namespace.
+    lbr_state_topic: state
+    joint_state_topic: /lbr_dual_arm_y_gripper/joint_states
+    lbr_command_topic: /rl_deploy/command_15hz
+    flange_pose_topic: /right/ee_pose
+    # Fingertip pose from KDL FK(q) to tip_link=gripper_tcp (matches sim). "flange_pose" = legacy.
+    fingertip_source: fk
+    robot_prefix: lbr_two
+    base_link: base_link
+    tip_link: lbr_two_gripper_tcp
+    fallback_tip_link: lbr_two_link_ee
+    flange_to_fingertip_xyz: [0.0, 0.0, 0.1463]
+    flange_to_fingertip_quat_wxyz: [1.0, 0.0, 0.0, 0.0]
+    robot_description: ""
+    robot_description_service: /lbr_dual_arm_y_gripper/robot_state_publisher/get_parameters
+
+    # Wrist F/T broadcaster. The node captures and subtracts a no-contact baseline at start_policy.
+    # estimated_ft_sensor wrench is DEAD on this cell (verified: 0.0 N under a 22 Nm hand press), and
+    # /state external_torque isn't reliably published -> use the always-live MEASURED joint torque and
+    # estimate the contact force from it via the Jacobian (gravity removed by the start baseline).
+    force_source: arm_measured_torque
+    # arm_measured_torque gives the force the ARM EXERTS; sim's force_sensor reads the force ON the tip
+    # (Newton's 3rd-law opposite), so flip to match sim's convention (socket resisting insertion -> +z).
+    ft_sign: -1.0
+    ft_bias_base_xyz: [0.0, 0.0, 0.0]
+    ft_baseline_on_start: true
+    ft_topic: /lbr_dual_arm_y_gripper/force_torque_broadcaster/wrench
+    ft_frame: flange
+    estop_topic: /rl_deploy/e_stop
+
+    # Byte-match the sim preprocessing path with deploy DR/noise off.
+    image_height: 224
+    image_width: 224
+    frame_stack: 1
+    depth_far_m: 0.3
+    ft_smoothing_factor: 0.25
+    force_noise_std: 0.0
+
+    # E2E policy action port. 0.01 m is the requested gentle real-robot step.
+    # ema_factor: sim trained with per-episode DR ema_factor_range [0.025, 0.1] (forge_env). 1.0
+    # (no smoothing) is far outside that range and makes the applied action AND the prev_action obs
+    # out-of-distribution. Keep this within [0.025, 0.1]; lower = gentler/heavier smoothing.
+    ema_factor: 0.0625
+    e2e_pos_action_scale: 0.01
+    e2e_rot_action_scale: 0.1
+    socket_action_bound: 0.05
+    ik_damping: 0.1
+    max_joint_step_rad: 0.0045
+    joint_limit_margin_rad: 0.03
+    # Software Z-compliance (force-limited insertion). OFF by default. When true, the downward push is
+    # scaled by max(0, 1 - |contact force|/z_force_limit_n) so the rigid FRI can't spike contact force
+    # past ~z_force_limit_n (near sim's 12N regime) -- a cheap stand-in for real Cartesian impedance.
+    # Enable it live to test:  ros2 param set /rl_deploy_inference z_force_limit_enable true
+    z_force_limit_enable: false
+    z_force_limit_n: 6.0
+
+    # Preinsert reset target. "socket_hover" = hover preinsert_hover_z_m above the perceived socket
+    # opening (no hand-measured joint pose needed); "joint" = fixed 7-joint pose. socket_hover needs a
+    # fresh socket + a roughly-upright start; it keeps the current fingertip orientation. UNTESTED on hw.
+    preinsert_mode: socket_hover
+    preinsert_hover_z_m: 0.06
+    preinsert_pos_tol_m: 0.005
+    # Only used when preinsert_mode: joint. Fill with measured iiwa q, then set the flag true.
+    preinsert_joint_position: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    preinsert_joint_position_set: false
+    preinsert_tolerance_rad: 0.01
+    preinsert_max_joint_step_rad: 0.006
+
+    # Safeguards and seating behavior.
+    input_timeout_s: 0.35
+    socket_timeout_s: 0.75
+    ft_force_cap_n: 25.0
+    ft_warn_n: 10.0
+    seat_force_n: 14.0
+    # First hardware runs: let the policy use the noisy socket estimate, but do NOT let that same
+    # estimate certify insertion. "manual" keeps hard stops only (force cap, timeout, e-stop/stale-input
+    # hold); operator stops on observed insertion. Use "auto_seat" later to re-enable geometry/depth/seat
+    # force success gates.
+    trial_stop_mode: manual
+    # Trial stop criteria. Geometry is measured in the perceived socket frame: opening z=0, bottom
+    # z=-seat_socket_depth_m. Used only when trial_stop_mode: auto_seat.
+    seat_socket_depth_m: 0.0175
+    seat_z_tolerance_m: 0.0045
+    seat_xy_tolerance_m: 0.004
+    # If force reaches the seating threshold while geometry says "not near the bottom", stop as a jam.
+    seat_force_requires_geometry: true
+    trial_timeout_s: 10.0
+    trial_max_overtravel_m: 0.002
+    seat_depth_roi_max_m: 0.0
+    freeze_on_seat: true
+    open_gripper_on_seat: false
+    gripper_open_topic: /gripper/open_cmd
+    gripper_open_value: 0.04
+
+    publish_debug_obs: true
+    obs_dump_path: ""

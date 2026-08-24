@@ -11,12 +11,18 @@ setup(
         (f"share/{package_name}", ["package.xml"]),
         (
             f"share/{package_name}/config",
-            ["config/deploy.yaml", "config/preinsert.yaml", "config/hole_align.yaml"],
+            [
+                "config/deploy.yaml",
+                "config/deploy_w2_estimator.yaml",
+                "config/preinsert.yaml",
+                "config/hole_align.yaml",
+            ],
         ),
         (
             f"share/{package_name}/launch",
             [
                 "launch/deploy_inference.launch.py",
+                "launch/deploy_inference_w2_estimator.launch.py",
                 "launch/preinsert_planner.launch.py",
                 "launch/hole_align_planner.launch.py",
             ],

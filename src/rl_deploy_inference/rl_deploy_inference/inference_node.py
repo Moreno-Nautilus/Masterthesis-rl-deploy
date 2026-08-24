@@ -177,11 +177,6 @@ class RLDeployInferenceNode(Node):
         self._robot_description: str | None = self.get_parameter("robot_description").value or None
 
         self.actor = self._load_actor()
-        if getattr(self.actor, "_aux_label_dim", 0) > 0:
-            self.get_logger().info(
-                f"Explicit-estimator checkpoint: feeding dummy '{self.actor._aux_label_key}' "
-                f"zeros (dim={self.actor._aux_label_dim}) each step; it has no effect on the action."
-            )
         self._init_kinematics_once()
         self._setup_ros_io()
 

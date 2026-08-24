@@ -8,3 +8,7 @@ __pycache__/
 *.egg-info/
 policy_obs_dump*.npz
 /outputs/
+.claude
+.codex
+AGENTS.md
+CLAUDE.md

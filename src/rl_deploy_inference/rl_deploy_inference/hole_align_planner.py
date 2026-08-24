@@ -264,8 +264,14 @@ class HoleAlignPlanner(Node):
         self.declare_parameter("fallback_to_perception", False)
 
         # ---- preinsert target (same contract as preinsert_planner) ----
-        self.declare_parameter("hover_z_m", 0.06)
-        self.declare_parameter("orientation_mode", "down")
+        # Final handoff hover: 4.2 cm TCP above the DETECTED hole (~ the sim start height; the policy
+        # takes over from here).
+        self.declare_parameter("hover_z_m", 0.042)
+        # "down_yaw" (default): straight down at an ABSOLUTE base-z yaw (down_yaw_deg), matched to the sim
+        # yaw band. See preinsert_planner for the other modes.
+        self.declare_parameter("orientation_mode", "down_yaw")
+        # Absolute start yaw about base z for down_yaw (deg); keep within a +/-30 deg cone of the sim nominal.
+        self.declare_parameter("down_yaw_deg", 0.0)
         self.declare_parameter("fixed_orientation_xyzw", [0.0, 0.0, 0.0, 1.0])
 
         # ---- planning tolerances / conservatism ----
@@ -496,6 +502,12 @@ class HoleAlignPlanner(Node):
             if mode in ("current_tcp", "down"):
                 return PlanResult(False, 0, "NO_TCP_TF", message=f"current TCP pose unavailable: {exc}")
             tcp_quat = None
+        down_yaw_deg = float(self.get_parameter("down_yaw_deg").value)
+        if mode == "down_yaw" and abs(down_yaw_deg) > 30.0:
+            self.get_logger().warn(
+                f"down_yaw_deg={down_yaw_deg:.0f} is outside the +/-30 deg sim-matched cone; the wrist "
+                "image will look more rotated than training saw."
+            )
         try:
             target_pos, target_quat = compute_preinsert_target(
                 (float(hole_base[0]), float(hole_base[1]), float(hole_base[2])),
@@ -503,6 +515,7 @@ class HoleAlignPlanner(Node):
                 hover_z_m=float(self.get_parameter("hover_z_m").value),
                 orientation_mode=mode,
                 fixed_quat_xyzw=tuple(self.get_parameter("fixed_orientation_xyzw").value),
+                down_yaw_deg=down_yaw_deg,
             )
         except ValueError as exc:
             return PlanResult(False, 0, "BAD_TARGET", message=str(exc))

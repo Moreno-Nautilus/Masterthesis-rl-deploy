@@ -140,6 +140,48 @@ def closest_down_quat_xyzw(current_quat_xyzw: QuaternionXYZW) -> QuaternionXYZW:
     return _quat_xyzw_from_rotmat(delta @ R)
 
 
+def down_quat_xyzw(yaw_deg: float) -> QuaternionXYZW:
+    """Gripper pointing exactly straight down, rotated by ``yaw_deg`` about the world +z (base) axis.
+
+    yaw=0 aligns the tool +x with base +x (the sim nominal, ``hand_init_orn=[pi,0,0]``); the tool
+    approach axis (tool +z) always points to world -z. Sim randomizes this yaw within +/-45 deg and the
+    5-DoF action has NO yaw channel (round peg), so any yaw in that band is in-distribution -- keep the
+    deploy start within a +/-30 deg cone of the sim yaw. This gives a DETERMINISTIC start orientation
+    (unlike ``down``, which snaps to the current wrist), so the wrist-camera image rotation is a known,
+    bounded quantity matched to training.
+    """
+    theta = math.radians(float(yaw_deg))
+    c, s = math.cos(theta), math.sin(theta)
+    # Columns = tool (x, y, z) axes in base_link; tool_z = [0,0,-1] (straight down).
+    R = np.array([
+        [c, s, 0.0],
+        [s, -c, 0.0],
+        [0.0, 0.0, -1.0],
+    ])
+    return _quat_xyzw_from_rotmat(R)
+
+
+def yaw_only_opening_base(
+    socket_pos: PositionXYZ,
+    socket_quat_xyzw: QuaternionXYZW,
+    offset_cad_xyz,
+) -> PositionXYZ:
+    """Socket OPENING in base = socket centre + ``R_yaw(socket_yaw) @ offset`` (perceived tilt ignored).
+
+    The base sits flat on the table, so only the socket's yaw about world z is trusted to place the
+    opening offset (e.g. ``[0.030, 0, 0.0175]`` for the right socket). The perceived roll/pitch is the
+    noisy part of the 6-D pose and would swing the ~30 mm lever arm around, so it is deliberately
+    dropped -- the opening z-offset stays vertical.
+    """
+    x, y, z, w = (float(v) for v in socket_quat_xyzw)
+    yaw = math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+    c, s = math.cos(yaw), math.sin(yaw)
+    off = np.asarray(offset_cad_xyz, dtype=np.float64).reshape(3)
+    dx = c * off[0] - s * off[1]
+    dy = s * off[0] + c * off[1]
+    return (float(socket_pos[0]) + dx, float(socket_pos[1]) + dy, float(socket_pos[2]) + float(off[2]))
+
+
 def compute_preinsert_target(
     socket_pos: PositionXYZ,
     current_tcp_quat_xyzw: QuaternionXYZW | None,
@@ -147,10 +189,13 @@ def compute_preinsert_target(
     hover_z_m: float,
     orientation_mode: str,
     fixed_quat_xyzw: QuaternionXYZW,
+    down_yaw_deg: float = 0.0,
 ) -> tuple[PositionXYZ, QuaternionXYZW]:
     """Pure preinsert-target math (no ROS): hover ``hover_z_m`` above the socket in global z.
 
     Position is the socket position raised by ``hover_z_m`` in the base/global frame. Orientation:
+      ``down_yaw``   -> tool exactly straight down at an ABSOLUTE ``down_yaw_deg`` yaw about base z
+                        (deterministic; matches the sim yaw band -- keep within +/-30 deg).
       ``down``       -> tool exactly straight down, yaw closest to the current wrist (minimal move).
       ``current_tcp``-> keep the current TCP orientation as-is.
       ``fixed``      -> the configured fixed quaternion.
@@ -168,8 +213,12 @@ def compute_preinsert_target(
         if current_tcp_quat_xyzw is None:
             raise ValueError("orientation_mode=down needs the current TCP orientation (TF)")
         quat = closest_down_quat_xyzw(current_tcp_quat_xyzw)
+    elif mode == "down_yaw":
+        quat = down_quat_xyzw(down_yaw_deg)
     else:
-        raise ValueError(f"unknown orientation_mode {orientation_mode!r} (use 'down', 'current_tcp' or 'fixed')")
+        raise ValueError(
+            f"unknown orientation_mode {orientation_mode!r} (use 'down_yaw', 'down', 'current_tcp' or 'fixed')"
+        )
     return target_pos, (float(quat[0]), float(quat[1]), float(quat[2]), float(quat[3]))
 
 
@@ -283,11 +332,23 @@ class PreinsertPlanner(Node):
         self.declare_parameter("socket_part_id", -1)
         self.declare_parameter("socket_timeout_s", 3.0)
 
-        # Socket pose is ~1 cm off physically -> hover HIGH and let the RL policy close the last cm.
-        self.declare_parameter("hover_z_m", 0.15)
-        # "down" (default): tool exactly straight down, yaw closest to the current wrist (minimal
-        # reorientation). "current_tcp": keep the current orientation. "fixed": fixed_orientation_xyzw.
-        self.declare_parameter("orientation_mode", "down")
+        # Aim the gross hover over the socket OPENING (yaw-only offset from the perceived pose), not the
+        # base CAD centre -- so the hole_align fine correction starts already above the right hole. Set
+        # false to recover the old behaviour (hover over the raw perceived socket position).
+        self.declare_parameter("aim_at_opening", True)
+        # Opening offset in the perceived socket CAD frame (RIGHT socket default; flip x for the LEFT).
+        # Only its yaw is applied (base is flat -> perceived tilt is dropped, opening z stays vertical).
+        self.declare_parameter("socket_opening_offset_cad_xyz", [0.030, 0.0, 0.0175])
+
+        # Gross-move waypoint: hover 10 cm above the opening; hole_align then descends to the ~4 cm handoff.
+        self.declare_parameter("hover_z_m", 0.10)
+        # "down_yaw" (default): tool exactly straight down at an ABSOLUTE base-z yaw (down_yaw_deg),
+        # deterministic and matched to the sim yaw band. "down": straight down, yaw closest to the current
+        # wrist. "current_tcp": keep the current orientation. "fixed": fixed_orientation_xyzw.
+        self.declare_parameter("orientation_mode", "down_yaw")
+        # Absolute start yaw about base z for down_yaw (deg). Sim randomizes yaw +/-45 deg and the action
+        # has no yaw DoF, so keep this within a +/-30 deg cone of the sim nominal (0 = tool +x along base +x).
+        self.declare_parameter("down_yaw_deg", 0.0)
         self.declare_parameter("fixed_orientation_xyzw", [0.0, 0.0, 0.0, 1.0])
 
         self.declare_parameter("position_tolerance_m", 0.01)
@@ -388,13 +449,33 @@ class PreinsertPlanner(Node):
                 return PlanResult(False, 0, "NO_TCP_TF", message=f"current TCP pose unavailable: {exc}")
             self.get_logger().warn(f"TCP pose via TF unavailable ({exc}); continuing (orientation_mode=fixed).")
 
+        down_yaw_deg = float(self.get_parameter("down_yaw_deg").value)
+        if mode == "down_yaw" and abs(down_yaw_deg) > 30.0:
+            self.get_logger().warn(
+                f"down_yaw_deg={down_yaw_deg:.0f} is outside the +/-30 deg sim-matched cone; the wrist "
+                "image will look more rotated than training saw."
+            )
+
+        # Aim over the socket OPENING (yaw-only offset from the perceived pose) rather than the CAD centre.
+        if self.get_parameter("aim_at_opening").value:
+            anchor_pos = yaw_only_opening_base(
+                socket.pos, socket.quat, self.get_parameter("socket_opening_offset_cad_xyz").value
+            )
+            self.get_logger().info(
+                f"opening anchor (base_link): pos={_fmt_xyz(anchor_pos)} "
+                f"(yaw-only offset {_fmt_xyz(self.get_parameter('socket_opening_offset_cad_xyz').value)} from socket)"
+            )
+        else:
+            anchor_pos = socket.pos
+
         try:
             target_pos, target_quat = compute_preinsert_target(
-                socket.pos,
+                anchor_pos,
                 current_tcp.quat if current_tcp else None,
                 hover_z_m=float(self.get_parameter("hover_z_m").value),
                 orientation_mode=mode,
                 fixed_quat_xyzw=tuple(self.get_parameter("fixed_orientation_xyzw").value),
+                down_yaw_deg=down_yaw_deg,
             )
         except ValueError as exc:
             return PlanResult(False, 0, "BAD_TARGET", message=str(exc))
