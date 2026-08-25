@@ -12,3 +12,5 @@ policy_obs_dump*.npz
 .codex
 AGENTS.md
 CLAUDE.md
+*.png
+*.yaml

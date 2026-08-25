@@ -11,10 +11,10 @@
     move_group_action: move_action
     joint_states_topic: joint_states
 
-    # ---- wrist camera (right arm D405 = realsense_2) ----
-    rgb_topic: /realsense_2/camera/color/image_rect
-    depth_topic: /realsense_2/camera/aligned_depth_to_color/image_rect
-    camera_info_topic: /realsense_2/camera/color/camera_info
+    # ---- wrist camera (right arm D405 = realsense_1, physically mounted on lbr_two) ----
+    rgb_topic: /realsense_1/camera/color/image_rect
+    depth_topic: /realsense_1/camera/aligned_depth_to_color/image_rect
+    camera_info_topic: /realsense_1/camera/color/camera_info
     camera_id: ""                           # "" -> derive from arm (realsense_2 / realsense_1)
     flange_link: ""                         # "" -> derive from arm (lbr_two_link_ee / lbr_one_link_ee)
     # Calibrated camera-optical -> flange (lbr_link_ee) offset. Same map the vision pipeline uses.

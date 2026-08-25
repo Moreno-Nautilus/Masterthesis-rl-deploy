@@ -14,6 +14,10 @@ setup(
             [
                 "config/deploy.yaml",
                 "config/deploy_w2_estimator.yaml",
+                "config/deploy_we_a.yaml",
+                "config/deploy_pdz_ep500.yaml",
+                "config/deploy_pdz_ep1000.yaml",
+                "config/deploy_pdz_ep1500.yaml",
                 "config/preinsert.yaml",
                 "config/hole_align.yaml",
             ],
@@ -23,6 +27,8 @@ setup(
             [
                 "launch/deploy_inference.launch.py",
                 "launch/deploy_inference_w2_estimator.launch.py",
+                "launch/deploy_inference_we_a.launch.py",
+                "launch/deploy_inference_pdz.launch.py",
                 "launch/preinsert_planner.launch.py",
                 "launch/hole_align_planner.launch.py",
             ],
@@ -38,6 +44,8 @@ setup(
     entry_points={
         "console_scripts": [
             "inference_node = rl_deploy_inference.inference_node:main",
+            "inference_node_we_a = rl_deploy_inference.inference_node_we_a:main",
+            "command_upsampler = rl_deploy_inference.command_upsampler:main",
             "obs_parity = rl_deploy_inference.parity_check:main",
             "preinsert_planner = rl_deploy_inference.preinsert_planner:main",
             "hole_align_planner = rl_deploy_inference.hole_align_planner:main",
