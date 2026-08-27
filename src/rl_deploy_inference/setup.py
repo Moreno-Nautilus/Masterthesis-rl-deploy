@@ -18,6 +18,8 @@ setup(
                 "config/deploy_pdz_ep500.yaml",
                 "config/deploy_pdz_ep1000.yaml",
                 "config/deploy_pdz_ep1500.yaml",
+                "config/deploy_pdz_v3_fulltilt.yaml",
+                "config/deploy_pdz_v3_fulltilt_single.yaml",
                 "config/preinsert.yaml",
                 "config/hole_align.yaml",
             ],

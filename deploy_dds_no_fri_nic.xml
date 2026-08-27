@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  FastDDS profile for the single-arm deploy: keep ALL DDS traffic OFF the FRI NIC.
+
+  WHY: enp3s0 carries BOTH the KUKA FRI real-time UDP link (192.170.20.1) AND a general LAN
+  (10.0.0.2). In deploy run #1 (pdz_20260827_154207) the FRI packet-read stalled 110 ms while the
+  200 Hz command output kept flowing, so the KUKA dropped COMMANDING_ACTIVE to MONITORING_READY.
+  Root cause: DDS/network bursts on enp3s0 (shared ROS domain 0 with the other student plus foxglove
+  image streaming) delayed the real-time FRI UDP read. Fix: never let DDS touch enp3s0.
+
+  HOW: whitelist ONLY loopback (lo, 127.0.0.1). Every deploy node runs on THIS one PC, so loopback
+  carries all inter-node ROS/DDS traffic at full speed. Both enp3s0 (FRI + LAN) AND wlo1 (WiFi) are
+  excluded from DDS, so the FRI UDP link has the wired NIC to itself and no DDS multicast goes out
+  over WiFi.
+
+  SSH IS UNAFFECTED: the user is SSH'd into this PC from a Mac over wlo1. SSH is plain TCP and has
+  nothing to do with DDS. This profile only changes which NIC ROS DDS binds to, applied per-node via
+  an env var. It does NOT touch wlo1's IP, routing, WiFi, or any OS network setting.
+  (Loopback-only means an off-box machine, e.g. Foxglove on the Mac, cannot see the ROS graph during
+  the run. That is intentional here; view via a node running on this PC instead.)
+
+  USE (in every deploy terminal, together with ROS_DOMAIN_ID):
+    export ROS_DOMAIN_ID=42
+    export FASTRTPS_DEFAULT_PROFILES_FILE=~/Masterthesis-rl-deploy/deploy_dds_no_fri_nic.xml
+    export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+  (Humble defaults to rmw_fastrtps_cpp; the export just makes it explicit.)
+-->
+<dds xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+  <profiles>
+    <transport_descriptors>
+      <transport_descriptor>
+        <transport_id>udp_no_fri</transport_id>
+        <type>UDPv4</type>
+        <!-- Loopback ONLY. enp3s0 (FRI 192.170.20.1 / LAN 10.0.0.2) and wlo1 (WiFi 10.5.x, the SSH
+             link) are both omitted, so DDS never touches the FRI NIC or the WiFi. -->
+        <interfaceWhiteList>
+          <address>127.0.0.1</address>
+        </interfaceWhiteList>
+      </transport_descriptor>
+    </transport_descriptors>
+
+    <participant profile_name="deploy_no_fri_nic" is_default_profile="true">
+      <rtps>
+        <userTransports>
+          <transport_id>udp_no_fri</transport_id>
+        </userTransports>
+        <!-- Do not also add the auto-built default transport (it would bind ALL NICs, incl. enp3s0). -->
+        <useBuiltinTransports>false</useBuiltinTransports>
+      </rtps>
+    </participant>
+  </profiles>
+</dds>
