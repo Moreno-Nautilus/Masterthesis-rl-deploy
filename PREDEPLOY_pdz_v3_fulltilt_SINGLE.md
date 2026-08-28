@@ -147,34 +147,34 @@ ros2 run rl_deploy_inference hole_align_planner --arm right --republish-anchor -
 # If occluded (no hole): add  -p anchor_use_fixed:=true -p anchor_xyz:="[<x>,<y>,<z>]"  (use T-HOLE's DETECTED value)
 ros2 topic echo /rl_deploy/corrected_socket --once
 
-── T-SWITCH JTC → RL CONTROLLER ──
+── T-CONTROLLER: KEEP JTC ACTIVE ──
 
 export FASTDDS_BUILTIN_TRANSPORTS=UDPv4
 source /opt/ros/humble/setup.bash
 source ~/kuka_fri_omar_ws/install/setup.bash
-ros2 topic info /lbr_dual_arm_y_gripper/command/joint_position -v   # Publisher count 0
-cat > /tmp/lbr_two_position_controller.yaml <<'EOF'
-/**/lbr_joint_position_command_controller:
-  ros__parameters:
-    robot_name: lbr_two
-EOF
-ros2 run controller_manager spawner lbr_joint_position_command_controller \
-  -c /lbr_dual_arm_y_gripper/controller_manager \
-  -t lbr_ros2_control/LBRJointPositionCommandController \
-  -p /tmp/lbr_two_position_controller.yaml
-# ROBOT MAY MOVE — hand on e-stop
-ros2 control switch_controllers -c /lbr_dual_arm_y_gripper/controller_manager \
-  --activate lbr_joint_position_command_controller \
-  --deactivate joint_trajectory_controller --strict
 ros2 control list_controllers -c /lbr_dual_arm_y_gripper/controller_manager
+# REQUIRED: joint_trajectory_controller active; lbr_joint_position_command_controller inactive.
+# The dual-arm JTC must have allow_partial_joints_goal: true so the bridge can command lbr_two only.
+# If needed (ROBOT MAY MOVE — hand on e-stop):
+ros2 control switch_controllers -c /lbr_dual_arm_y_gripper/controller_manager \
+  --activate joint_trajectory_controller \
+  --deactivate lbr_joint_position_command_controller --strict
+ros2 topic info /lbr_dual_arm_y_gripper/joint_trajectory_controller/joint_trajectory -v
+ros2 topic echo /lbr_dual_arm_y_gripper/state --once
+# Before start_policy: session_state=4, connection_quality=3, safety_state=0, drive_state=2,
+# client_command_mode=1, overlay_type=1. This profile expects control_mode=0; if the pendant reports
+# control_mode=1 Cartesian impedance, set expected_control_mode:=1 deliberately before starting.
 
-── T-UPSAMPLE 15 Hz → 200 Hz bridge (only ONE) ──
+── T-GUARDED 15 Hz → JTC BRIDGE (only ONE) ──
 
 export FASTDDS_BUILTIN_TRANSPORTS=UDPv4
 source /opt/ros/humble/setup.bash
 source ~/kuka_fri_omar_ws/install/setup.bash
 source ~/Masterthesis-rl-deploy/install/setup.bash
-python3 ~/Masterthesis-rl-deploy/src/rl_deploy_inference/scripts/command_upsampler.py --interpolate
+ros2 run rl_deploy_inference guarded_joint_trajectory_bridge
+# Enforces: fresh measured joints, 0.5deg max target lead, 0.35deg tracking error,
+# and stateful 3/30/300 deg/s(/s2,/s3) q/dq/ddq quintic horizons.
+# Do NOT run command_upsampler at the same time.
 
 ── T-BAG ROSBAG ──
 
@@ -184,10 +184,15 @@ source ~/Masterthesis-vision/install/setup.bash
 source ~/Masterthesis-rl-deploy/install/setup.bash
 mkdir -p ~/deploy_bags
 ros2 bag record -o ~/deploy_bags/pdz_single_$(date +%Y%m%d_%H%M%S) \
-  /rl_deploy/policy_obs /rl_deploy/command_15hz /lbr_dual_arm_y_gripper/command/joint_position \
-  /rl_deploy/corrected_socket /rl_deploy/status /rl_deploy/seat_detected \
-  /lbr_dual_arm_y_gripper/joint_states /lbr_dual_arm_y_gripper/force_torque_broadcaster/wrench \
+  /rl_deploy/policy_obs /rl_deploy/command_15hz \
+  /lbr_dual_arm_y_gripper/joint_trajectory_controller/joint_trajectory \
+  /rl_deploy/corrected_socket /rl_deploy/status /rl_deploy/seat_detected /rosout \
+  /lbr_dual_arm_y_gripper/state /lbr_dual_arm_y_gripper/joint_states \
+  /lbr_dual_arm_y_gripper/force_torque_broadcaster/wrench \
   /realsense_2/camera/color/image_rect /realsense_2/camera/aligned_depth_to_color/image_rect
+# In one additional terminal, capture actual FRI packets. This distinguishes a missing controller packet
+# from a late/missing client reply; the 200Hz ROS command topic cannot do that. Ctrl-C after the attempt.
+sudo tcpdump -i enp3s0 -s 0 -B 4096 -w ~/deploy_bags/fri_$(date +%Y%m%d_%H%M%S).pcap 'udp port 30201'
 
 ── T-RL DEPLOY NODE — **[SINGLE: single-arm YAML]** (motion gated) ──
 
@@ -205,7 +210,8 @@ ros2 launch rl_deploy_inference deploy_inference_pdz.launch.py \
 
 ros2 param set /rl_deploy_inference obs_dump_path /tmp/deploy_pdz_obs.npz
 ros2 param set /rl_deploy_inference max_joint_step_rad 0.0
-ros2 service call /rl_deploy/start_policy std_srvs/srv/Trigger "{}"   # REFUSED (gated) — fine; obs still dumps
+ros2 service call /rl_deploy/start_policy std_srvs/srv/Trigger "{}"   # starts with q-step clamped to zero
+sleep 1
 ros2 service call /rl_deploy/stop_policy  std_srvs/srv/Trigger "{}"
 python3 -c "import numpy as np; d=np.load('/tmp/deploy_pdz_obs.npz'); p=d['policy']; print('shape',p.shape); print('force[6:9]',p[...,6:9])"
 #   (live obs also on topic /rl_deploy/policy_obs — force is indices [6:9] of the 15-D vector)
@@ -220,18 +226,16 @@ ros2 param set /rl_deploy_inference we_a_geometry_calibrated true     # after sc
 ros2 param set /rl_deploy_inference we_a_force_bias_calibrated true   # after T-PARITY: force[6:9]≈0 + contact sign correct
 ros2 param set /rl_deploy_inference enable_motion true
 ros2 service call /rl_deploy/start_policy std_srvs/srv/Trigger "{}"
-#   WATCH: sim shows IMPACT SPIKES 22-65N + a 40-60mm bounce, then recover-and-seat. ft_force_cap_n=42 (raised
-#   from 25) allows the bounce through so you can see if the real FRI recovers like sim. A hard stuck-jam still
-#   trips at 42. Log outcome + |F|max + did it seat. WEAK LINK = the 3D-printed part (watch for marring).
+#   WATCH: applied TCP step is capped at 1mm/tick, downward motion attenuates toward 6N,
+#   raw contact force aborts at 15N, and the trajectory bridge must remain unlatched.
 
 ── STOP / CLEAR / RESTORE MOVEIT ──
 
 ros2 service call /rl_deploy/stop_policy std_srvs/srv/Trigger "{}"
 ros2 service call /rl_deploy/clear_latches std_srvs/srv/Trigger "{}"
-# back to MoveIt (Ctrl-C T-RL, T-UPSAMPLE, T-ANCHOR first):
-ros2 control switch_controllers -c /lbr_dual_arm_y_gripper/controller_manager \
-  --activate joint_trajectory_controller \
-  --deactivate lbr_joint_position_command_controller --strict
+ros2 service call /rl_deploy/clear_bridge_latch std_srvs/srv/Trigger "{}"
+# MoveIt already owns the same JTC. Ctrl-C T-RL, T-GUARDED, and T-ANCHOR, then verify JTC remains active:
+ros2 control list_controllers -c /lbr_dual_arm_y_gripper/controller_manager
 
 ── WHEN FULLY DONE ──
 

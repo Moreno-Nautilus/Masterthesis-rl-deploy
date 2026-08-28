@@ -7,8 +7,9 @@ override for the other spread checkpoints, e.g.::
     ros2 launch rl_deploy_inference deploy_inference_pdz.launch.py \
         params_file:=$(ros2 pkg prefix rl_deploy_inference)/share/rl_deploy_inference/config/deploy_pdz_ep500.yaml
 
-NODE-ONLY (no bundled command_upsampler): run the 15 Hz -> 200 Hz bridge separately, e.g.
-``ros2 run rl_deploy_inference command_upsampler --interpolate``. Do not also start a second upsampler.
+NODE-ONLY (no bundled command bridge): for hardware, keep ``joint_trajectory_controller`` active and
+run ``ros2 run rl_deploy_inference guarded_joint_trajectory_bridge``. Do not also start the legacy
+direct-position upsampler.
 """
 
 from __future__ import annotations

@@ -48,6 +48,7 @@ setup(
             "inference_node = rl_deploy_inference.inference_node:main",
             "inference_node_we_a = rl_deploy_inference.inference_node_we_a:main",
             "command_upsampler = rl_deploy_inference.command_upsampler:main",
+            "guarded_joint_trajectory_bridge = rl_deploy_inference.guarded_joint_trajectory_bridge:main",
             "obs_parity = rl_deploy_inference.parity_check:main",
             "preinsert_planner = rl_deploy_inference.preinsert_planner:main",
             "hole_align_planner = rl_deploy_inference.hole_align_planner:main",

@@ -1,0 +1,200 @@
+# Contact-Safe Deployment Changes and Test Plan
+
+Date: 2026-08-28  
+Branch: `moreno`  
+Reference implementation: [Julien Casalini's `assembly_cell_ws`](https://github.com/JulienCasalini/assembly_cell_ws), inspected at commit `30b2083dbe10b5572346e074bbf7b481a6bac6ef`.
+
+## Short conclusion
+
+The guarded deployment changes are justified by both Julien's surviving contact implementation and our raw rosbags. The old deployment asked for large Cartesian changes, converted them to discontinuous 15 Hz joint targets, and linearly streamed positions directly at 200 Hz. Five of the six available raw bags contain the same approximately 110 ms robot-state and wrench interruption at contact, while the separate PC upsampler continues publishing 22 direct joint-command messages during the interruption.
+
+**Correction after tracing Humble v2.2.3:** the 110 ms gap is almost certainly a shutdown artifact *after* FRI has already left `COMMANDING_ACTIVE`, not the cause of the FRI drop. `SystemInterface::read()` sees the session transition and synchronously calls `App::close_udp_socket()`. That function waits for the FRI worker using a fixed 100 ms polling sleep. One normal 10 ms update plus this 100 ms wait explains the repeatable 110 ms interval. The bags therefore locate the drop at contact, but do not show whether it was initiated by a missed PC reply, missing controller packet, Sunrise motion/safety transition, or another controller-side condition.
+
+The regular 200 Hz ROS command topic does **not** prove that the actual FRI UDP loop remained healthy: it is produced by a separate upsampler process upstream of `ros2_control` and the FRI client. It does show that our old path was aggressive and unsupervised compared with Julien's, and that changing this path is still the strongest low-risk motion experiment before modifying the Sunrise application or FRI stack.
+
+Confidence is therefore **moderate, not high**. I expect the new path to reduce the contact transient and to stop safely when state or tracking is unhealthy. I cannot promise that Sunrise will keep FRI active through contact, especially if the remaining material difference is native position control versus Cartesian impedance control.
+
+## What the raw bags add
+
+I read the SQLite rosbag storage directly rather than relying only on the extracted CSV plots. The six available raw bags are under `~/deploy_bags`.
+
+| Run | Policy observations | Largest joint-state gap | Force around gap | Direct commands inside gap | Policy translation request, median / max | Policy rotation request, max |
+|---|---:|---:|---:|---:|---:|---:|
+| `20260827_165249` | 150 | 110.157 ms | 9.118 -> 10.029 N | 22 | 6.993 / 7.259 mm | 2.740 deg |
+| `20260827_171512` | 150 | 110.233 ms | 11.059 -> 12.094 N | 22 | 5.451 / 5.611 mm | 6.681 deg |
+| `20260828_134142` | 7 | 16.013 ms max, no drop signature | 6.251 N peak | 0 in a large gap | 1.043 / 1.433 mm | 1.080 deg |
+| `20260828_134445` | 150 | 110.069 ms | 10.175 -> 10.175 N | 22 | 4.768 / 6.413 mm | 6.821 deg |
+| `20260828_135128` | 150 | 110.127 ms | 10.775 -> 12.054 N | 22 | 7.002 / 7.191 mm | 2.418 deg |
+| `20260828_140335` | 150 | 110.234 ms | 12.465 -> 12.465 N | 22 | 7.089 / 7.223 mm | 2.506 deg |
+
+The translation and rotation values are reconstructed from the previous-action fields in `/rl_deploy/policy_obs`, after the old EMA and before IK. They describe requested target changes, not measured TCP travel.
+
+### Findings beyond the previous CSV analysis
+
+1. The repeatable 110 ms interval matches the stack's post-transition shutdown path: 100 ms polling sleep plus the normal approximately 10 ms controller update. Treat it as evidence that the session transition occurred, not as the network outage duration or its cause.
+2. The contact force is a steep ramp into the transition, not literally an instantaneous 0-to-10 N discontinuity. For example, `165249` rises from 2.08 N to 9.12 N over about 110 ms and later records 10.03 N. In two of the 30 Hz runs, the recorded force peak occurs about 30 ms before the state gap.
+3. `e2e_pos_action_scale: 0.005` limits each axis to 5 mm, not the 3D translation norm to 5 mm. A multi-axis action can request up to `sqrt(3) * 5 mm = 8.66 mm`. The failed runs actually request as much as 7.26 mm per 15 Hz tick, and 97-98% of their active requests exceed 1 mm.
+4. Rotation requests are also substantial: maxima are 2.4-6.8 degrees per tick in the failed runs. The new 0.5 degree norm limit is therefore meaningful, not cosmetic.
+5. Peak velocity inferred from the old direct output is 4.75-7.79 deg/s in the failed runs. Julien's guarded path uses a 3 deg/s joint limit, with 30 deg/s2 acceleration and 300 deg/s3 jerk limits.
+6. The old upsampler keeps publishing after the FRI/ros2_control path is gone. In `165249`, the bag continues for 212.7 seconds after the final joint state and contains another **42,543** direct position commands. This cannot restore the FRI session and does not demonstrate actual UDP command delivery.
+7. None of the old bags records `/lbr_dual_arm_y_gripper/state`, `/rosout`, or FRI UDP packets. Consequently, the bags cannot establish which side missed the deadline or the exact state/quality/safety ordering.
+8. A 15 N force cap alone would not have prevented these recorded events: the transitions occur around 9-12.5 N. The more relevant protections are smaller applied steps, force-dependent downward attenuation, a smoother JTC trajectory, tracking/state checks, and possibly Cartesian impedance on Sunrise.
+
+The short non-drop run `134142` is suggestive but not a control experiment. It contains only seven policy observations, requested much smaller translations, reached only 6.25 N, and then stopped because RGB became stale.
+
+## Why each change was made
+
+### 1. Keep `joint_trajectory_controller` active
+
+The old procedure deactivated the standard JTC, activated `LBRJointPositionCommandController`, and ran `command_upsampler.py --interpolate` to publish direct positions at 200 Hz.
+
+The new procedure leaves JTC active and starts:
+
+```bash
+ros2 run rl_deploy_inference guarded_joint_trajectory_bridge
+```
+
+The bridge converts each 15 Hz policy target into a short `JointTrajectory` containing position, velocity, and acceleration samples. This matches the architecture used by Julien and lets ros2_control own the trajectory handoff instead of sending piecewise-linear positions directly to FRI.
+
+### 2. Make trajectory generation stateful and derivative-bounded
+
+The bridge carries its planned `q`, `dq`, and `ddq` state from one policy tick into the next and uses quintic trajectories. Its current limits are:
+
+| Guard | Value |
+|---|---:|
+| Joint velocity | 3 deg/s |
+| Joint acceleration | 30 deg/s2 |
+| Joint jerk | 300 deg/s3 |
+| Maximum target lead from measured joints | 0.5 deg |
+| Maximum measured-to-planned tracking error | 0.35 deg |
+| Joint-state maximum age | 50 ms |
+
+The 0.35 degree threshold is close to the largest old direct-command lead, 0.349 degrees. The new smoother should reduce that lead, but this threshold may latch during commissioning. A latch is useful evidence; do not raise it before inspecting the measured and planned trajectories.
+
+### 3. Bound the physical Cartesian step by vector norm
+
+The actor still runs with its trained scales, but the applied action and `prev_action` are rescaled to at most:
+
+```yaml
+max_policy_position_step_m: 0.001
+max_policy_rotation_step_rad: 0.00872665  # 0.5 deg
+```
+
+This preserves direction while limiting the total translation/rotation norm. It directly addresses the 5.6-7.3 mm and 2.4-6.8 degree requests visible in the failed bags.
+
+### 4. Require healthy, fresh FRI state
+
+Both inference nodes can now refuse motion unless fresh `LBRState` reports:
+
+| Field | Required value |
+|---|---|
+| `session_state` | 4, `COMMANDING_ACTIVE` |
+| `connection_quality` | 3, `EXCELLENT` |
+| `safety_state` | 0, `NORMAL_OPERATION` |
+| `drive_state` | 2, `ACTIVE` |
+| `client_command_mode` | 1, `POSITION` |
+| `overlay_type` | 1, `JOINT` |
+| `control_mode` | The configured expected native mode |
+
+This is a fail-closed guard and a diagnostic improvement. It cannot stop Sunrise from dropping FRI, but it prevents the policy from continuing as though the session were healthy.
+
+### 5. Use raw contact force for safety
+
+The policy observation may still use EMA-smoothed force, but the force warning and abort evaluate the current baseline-subtracted force. Safety should not wait for observation smoothing during a fast contact ramp.
+
+Current commissioning settings attenuate only downward target motion as force approaches 6 N and latch a force abort at 15 N:
+
+```yaml
+z_force_limit_enable: true
+z_force_limit_n: 6.0
+ft_warn_n: 8.0
+ft_force_cap_n: 15.0
+```
+
+Because the historical gap occurs below 15 N, use 10 N as the first commissioning cap if the objective is diagnosis rather than completing an insertion. Julien's launch also defaults to a 10 N baseline-relative abort. The 6 N attenuation is expected to matter more than either hard cap because it acts before the old drop range.
+
+### 6. Record the missing evidence
+
+The runbook now records `LBRState`, `/rosout`, and the JTC trajectory topic, and it calls for a simultaneous packet capture on UDP port 30201. `LBRState` may still miss the final bad state because the hardware `read()` returns an error immediately after detecting the transition. The FRI `onStateChange` log and packet direction/timing are therefore essential.
+
+## Important remaining Julien difference
+
+Julien uses the same standard Humble-era LBR/FRI stack, but his real-insertion launch expects native Sunrise `CARTESIAN_IMPEDANCE_CONTROL` (`control_mode=1`) for contact. His documented Sunrise server uses compliant lateral stiffness and damping for peg-in-hole work. Our current local fulltilt deployment profiles expect native position control (`control_mode=0`).
+
+That may be as important as the ROS command bridge. The ROS parameter `expected_control_mode` only verifies the live mode; changing it does **not** switch Sunrise into impedance control. The mode must be selected/configured in the Sunrise application, then confirmed from the live `LBRState`. Before drawing a conclusion from the guarded test, record Julien's actual startup line and our own, including control mode, send period, and receive multiplier.
+
+Do not copy impedance stiffness or tool-load settings blindly. They are robot/tool-specific and belong to Sunrise commissioning.
+
+## What changes for deployment
+
+1. Build and source this branch before starting the deployment node.
+2. Leave `joint_trajectory_controller` active. Do not activate `lbr_joint_position_command_controller` for the policy run.
+3. Run exactly one bridge: `guarded_joint_trajectory_bridge`. Do not run the legacy `command_upsampler` at the same time.
+4. Echo `/lbr_dual_arm_y_gripper/state` before enabling motion. Set `expected_control_mode` to the value intentionally selected on Sunrise, not the value that merely makes the check pass.
+5. Start the rosbag before policy motion and include `LBRState`, JTC trajectory, policy target, measured joints, raw wrench, and status.
+6. After any bridge latch, inspect the reason before calling `/rl_deploy/clear_bridge_latch`.
+7. Keep an operator at the enabling device/e-stop and begin below the old contact-force range.
+
+The exact terminal sequence is maintained in `PREDEPLOY_pdz_v3_fulltilt_SINGLE.md`.
+
+### Configuration portability warning
+
+The edited local profiles
+
+```text
+src/rl_deploy_inference/config/deploy_pdz_v3_fulltilt.yaml
+src/rl_deploy_inference/config/deploy_pdz_v3_fulltilt_single.yaml
+```
+
+are currently ignored by the repository's broad `*.yaml` rule. They contain the guard values in this document on this machine, and the installed symlink workspace sees them, but those edits will not automatically travel with a normal commit/clone until the profiles are deliberately force-tracked or the ignore rule is narrowed. Verify the live parameters with `ros2 param get` during commissioning.
+
+## Does training need to change?
+
+**Not for the next FRI-survival test.** The present checkpoint is suitable for testing whether safer deployment survives contact. Retraining now would change two variables at once and make the result harder to interpret.
+
+The 1 mm/0.5 degree guards do materially alter almost every active action in the failed runs, so the current checkpoint may become slower or fail to finish the task within its old timeout. That is acceptable for the first experiment: the endpoint is "FRI stayed healthy through repeated controlled contact," not insertion success.
+
+For the final policy, retrain or fine-tune with the deployment actuator model after the FRI issue is isolated. Training should include the same vector-norm action limits, 15 Hz action hold, bounded joint/Cartesian response, force-dependent downward attenuation, realistic compliance/control mode, and the same force observation preprocessing used on hardware. Then success rate can be judged without a train/deploy dynamics mismatch.
+
+## Next evidence: staged test
+
+### Stage A: no-motion instrumentation check
+
+1. Start hardware, JTC, guarded bridge, inference node, and rosbag.
+2. Keep policy motion disabled or set `max_joint_step_rad` to zero for the observation check.
+3. Confirm fresh joints/wrench and continuously healthy `LBRState` for at least 30 seconds.
+4. Confirm there is one JTC trajectory publisher and no direct-position upsampler.
+5. Capture both directions of FRI UDP traffic on port 30201.
+
+### Stage B: contact without policy advance
+
+With the robot holding through JTC and under the lab's normal contact-safety procedure, introduce a small controlled external load without policy motion. This separates "contact alone breaks the Sunrise/FRI session" from "our commanded approach creates the failure."
+
+Pass evidence: repeated force ramps through approximately 4-6 N with no state gap above 30 ms, no FRI quality/state transition, and no bridge latch.
+
+### Stage C: very small policy contact
+
+Use a 0.25 mm position cap, 0.25 degree rotation cap, a 4 N downward attenuation point, a 10 N raw-force abort, and a short trial timeout. Run at least five controlled contacts. Then repeat at 0.5 mm and finally at the current 1 mm cap only if the earlier stages remain healthy.
+
+Record for every attempt:
+
+- First-contact force and force rise rate.
+- Maximum joint-state and wrench inter-arrival gap.
+- FRI session, quality, control mode, overlay, and drive-state transitions.
+- Bridge target lead, tracking error, and latch reason.
+- JTC trajectory position/velocity/acceleration continuity.
+- Whether the arm retracted/held normally after the contact.
+- First missing or late UDP direction: controller-to-PC monitoring packet or PC-to-controller reply.
+
+### Stage D: control-mode comparison
+
+If position-control contact still reproduces the 110 ms interruption, repeat the same conservative test with the correctly commissioned Sunrise Cartesian impedance mode used for contact work. Keep the ROS trajectory and action limits identical so control mode is the only material variable.
+
+### Decision rule
+
+- If Stage B drops FRI with no policy motion, command shaping is not sufficient; focus on Sunrise control mode, FRI application behavior, tool/load configuration, receive multiplier, and network/session logs.
+- If Stage B survives but Stage C drops, the commanded approach or force ramp is implicated; keep the guarded path and lower motion/force limits based on the trajectory trace.
+- If position mode drops but impedance mode survives, native contact compliance is the decisive difference.
+- If all guarded stages survive, only then extend the timeout and evaluate policy insertion performance.
+
+The next step is therefore testing, but in controlled stages. One successful insertion is encouraging; repeated contact with synchronized `LBRState`, `/rosout`, force, measured-joint, trajectory, and packet-timing evidence is what will tell us whether the deployment fix actually solved the FRI failure mode.

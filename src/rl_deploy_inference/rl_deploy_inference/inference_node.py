@@ -22,6 +22,7 @@ from std_srvs.srv import Trigger
 from std_msgs.msg import Bool, Float32MultiArray, Float64, String
 import yaml
 
+from .deployment_guards import fri_state_problem, limit_action_step
 from .ik import (
     action_to_target_pose,
     get_delta_dof_pos,
@@ -146,6 +147,7 @@ class RLDeployInferenceNode(Node):
         self.joint_pos = TimedValue()
         self.joint_effort = TimedValue()
         self.external_torque = TimedValue()
+        self.lbr_state = TimedValue()
         self.cam_intrinsics: tuple | None = None
 
         self.prev_ft_pos: np.ndarray | None = None
@@ -256,6 +258,10 @@ class RLDeployInferenceNode(Node):
         self.declare_parameter("socket_opening_offset_cad_xyz", [0.0, 0.0, 0.0])
 
         self.declare_parameter("lbr_state_topic", "state")
+        self.declare_parameter("require_fri_state", False)
+        self.declare_parameter("fri_state_max_age_s", 0.2)
+        # -1 accepts either native control mode; hardware profiles should pin this to 0 or 1.
+        self.declare_parameter("expected_control_mode", -1)
         self.declare_parameter("joint_state_topic", "/lbr_dual_arm/joint_states")
         self.declare_parameter("lbr_command_topic", "command/joint_position")
         self.declare_parameter("flange_pose_topic", "/right/ee_pose")
@@ -306,6 +312,10 @@ class RLDeployInferenceNode(Node):
         self.declare_parameter("ema_factor", 0.0625)
         self.declare_parameter("e2e_pos_action_scale", 0.01)
         self.declare_parameter("e2e_rot_action_scale", 0.1)
+        # Independent hardware guards. The actor still uses its trained scales, but the applied action
+        # and prev_action observation are clipped to these physical per-tick limits.
+        self.declare_parameter("max_policy_position_step_m", 0.0)
+        self.declare_parameter("max_policy_rotation_step_rad", 0.0)
         self.declare_parameter("socket_action_bound", 0.08)
         self.declare_parameter("ik_damping", 0.1)
         self.declare_parameter("max_joint_step_rad", 0.010)
@@ -561,8 +571,21 @@ class RLDeployInferenceNode(Node):
 
     def _on_lbr_state(self, msg: LBRState) -> None:
         stamp = time.monotonic()
+        self.lbr_state = TimedValue(msg, stamp)
         self.joint_pos = TimedValue(np.asarray(msg.measured_joint_position, dtype=np.float64), stamp)
         self.external_torque = TimedValue(np.asarray(msg.external_torque, dtype=np.float64), stamp)
+
+    def _fri_problem(self) -> str:
+        """Return a fail-closed FRI-state problem, or an empty string."""
+        if not bool(self.get_parameter("require_fri_state").value):
+            return ""
+        max_age = float(self.get_parameter("fri_state_max_age_s").value)
+        if not self.lbr_state.fresh(max_age):
+            return "FRI state is missing or stale"
+        return fri_state_problem(
+            self.lbr_state.value,
+            int(self.get_parameter("expected_control_mode").value),
+        )
 
     def _on_joint_state(self, msg: JointState) -> None:
         by_name = {name: pos for name, pos in zip(msg.name, msg.position)}
@@ -611,6 +634,11 @@ class RLDeployInferenceNode(Node):
         if self.manual_estop or self.force_cap_latched:
             response.success = False
             response.message = "safety latch/e-stop active; stop motion and clear before starting."
+            return response
+        ready, reason = self._ready()
+        if not ready:
+            response.success = False
+            response.message = f"policy preflight failed: {reason}"
             return response
         self.mode = MODE_POLICY
         self.prev_action[:] = 0.0
@@ -788,6 +816,9 @@ class RLDeployInferenceNode(Node):
             return False, "stale/missing: " + ", ".join(missing)
         if self.kinematics is None:
             return False, "kinematics unavailable"
+        fri_problem = self._fri_problem()
+        if fri_problem:
+            return False, "FRI: " + fri_problem
         return True, ""
 
     def _control_tick(self) -> None:
@@ -828,8 +859,13 @@ class RLDeployInferenceNode(Node):
         self.prev_ft_pos = fingertip_pos.copy()
         self.prev_ft_quat = fingertip_quat.copy()
 
-        ft_smooth = self.force_smoother.update(self._contact_force_base(jac))
-        force_norm = float(np.linalg.norm(ft_smooth))
+        raw_force = self._contact_force_base(jac)
+        ft_smooth = self.force_smoother.update(raw_force)
+        force_bias = np.asarray(
+            self.get_parameter("ft_bias_base_xyz").value, dtype=np.float64
+        ).reshape(3)
+        # Safety reacts to the unsmoothed, baseline-subtracted contact force. Smoothing is observation-only.
+        force_norm = float(np.linalg.norm(raw_force - force_bias))
         socket_center, socket_quat = self.socket_pos.value
         socket_pos = self._socket_opening(socket_center, socket_quat)
 
@@ -872,7 +908,14 @@ class RLDeployInferenceNode(Node):
         raw_action = np.clip(self.actor.act(make_actor_obs(policy, image)), -1.0, 1.0)
         ema = float(self.get_parameter("ema_factor").value)
         action = ema * raw_action + (1.0 - ema) * self.prev_action
-        self.prev_action = action.astype(np.float32)
+        action = limit_action_step(
+            action,
+            position_scale_m=float(self.get_parameter("e2e_pos_action_scale").value),
+            rotation_scale_rad=float(self.get_parameter("e2e_rot_action_scale").value),
+            max_position_step_m=float(self.get_parameter("max_policy_position_step_m").value),
+            max_rotation_step_rad=float(self.get_parameter("max_policy_rotation_step_rad").value),
+        )
+        self.prev_action = action.copy()
 
         target_pos, target_quat = action_to_target_pose(
             action=action,

@@ -1,12 +1,17 @@
 # FRI drops on contact — diagnosis + fix ladder (2026-08-28)
 
-## Confirmed problem (4 bags, 100% consistent)
-The FRI session drops (COMMANDING_ACTIVE -> MONITORING, ERROR_FRI_CMD_WRONG_STATE_ACTIVE) with a
-single ~110 ms robot->PC joint_states freeze, landing EXACTLY on the first contact force step
-(0 -> 10-12 N) in every run. PC keeps publishing commands at 200 Hz through the gap (PC side fine).
-Tracking error stays ~2 mrad (robot tracks fine). Motion is slow (~0.05 rad/s) so it's the FORCE
-event, not speed. Pendant shows Quality POOR / Jitter 3.4 ONLY at contact. ReceiveMultiplier=1 =
-zero tolerance for the 110 ms gap -> instant drop.
+## Confirmed problem and 110 ms correction
+The FRI session drops (`COMMANDING_ACTIVE -> MONITORING`, `ERROR_FRI_CMD_WRONG_STATE_ACTIVE`) during
+the first substantial contact ramp. Five of six available raw bags show a repeatable ~110 ms gap in
+joint/wrench publication at the transition.
+
+That 110 ms interval is almost certainly a **post-drop shutdown artifact**, not the cause or measured
+duration of a robot-to-PC network freeze. Humble v2.2.3 detects that FRI already left
+`COMMANDING_ACTIVE`, calls `close_udp_socket()` synchronously from `SystemInterface::read()`, and waits
+for the worker with a fixed 100 ms polling sleep. One normal 10 ms update plus that sleep explains the
+observed ~110 ms. The independent 200 Hz ROS command topic continuing does not prove the FRI UDP send
+loop was healthy. The old bags did not record `LBRState`, `/rosout`, or packets, so they cannot tell
+which UDP direction or Sunrise condition initiated the transition.
 
 ## ⚠️ UPDATE 2026-08-28 — FTEstimator theory DISPROVEN by test
 Ran the deploy with FTEstimator at 30 Hz (CONFIRMED live: wrench value-change rate measured 26 Hz in
@@ -14,10 +19,9 @@ bag `pdz_single_30hz_20260828_140335`). **It STILL dropped at contact**, identic
 stall at policy tick 18/150, |F| went 4→1→6→12 N into the drop, command stream fine (5 ms) = PC fine,
 robot-side freeze. Force-threshold=0 also applied, no effect. => The async-FTEstimator-contention root
 cause below is WRONG. The drop is a ROBOT-SIDE reaction to the contact force transient, independent of
-PC RT/pinning/CPU/estimator-rate (all tried, none fixed it). The ONLY remaining fix that addresses the
-actual mechanism is **ReceiveMultiplier 1→3 on the pendant** (fix #2). Do NOT spend more on PC-side
-estimator tuning. Optional PC-side long-shot: lower e2e_pos_action_scale 0.005→0.003 to shrink the
-0→12 N transient (untested, low confidence).
+PC RT/pinning/CPU/estimator-rate (all tried, none fixed it). Julien's surviving deployment does not set
+ReceiveMultiplier in source; instead it differs materially in command shaping and safety supervision.
+The primary next test is therefore the guarded JTC path, not more estimator tuning.
 
 ## Root cause (ORIGINAL THEORY — now disproven, see UPDATE above)
 The async `lbr_fri_ros2::FTEstimator` runs its own thread at update_rate=100 Hz / rt_prio=30, next to
@@ -38,10 +42,14 @@ flowing. The policy reads force at 15 Hz, so any estimator rate >= ~20 Hz feeds 
    lbr_two_system_config.yaml (right) and lbr_one_system_config.yaml (left). 30 Hz >> 15 Hz policy,
    < 100 Hz controller_manager. Keeps force + safety + seat-detect. TEST THIS FIRST.
    - If still drops: try 20 Hz (still > 15 Hz policy).
-2. **ReceiveMultiplier 1 -> 3** on the pendant (Sunrise LBRServer_select.java, setReceiveMultiplier(3)).
-   One line, needs Sunrise Workbench (another person). Lets the session survive the 110 ms gap
-   regardless of cause. See ../FRI_RECEIVE_MULTIPLIER_FIX.md.
-2b. **PC-SIDE ESTIMATION (the ace — likely better than the backport)**: the deploy node ALREADY
+2. **Guard the deployment command path** [IMPLEMENTED on branch `moreno`]: keep JTC active; publish
+   stateful q/dq/ddq quintic horizons; cap applied TCP change to 1 mm/tick and 0.5 deg/tick; use raw
+   baseline-subtracted force for the 15 N abort; attenuate downward command toward 6 N; require healthy
+   live FRI state before and during policy motion.
+3. **ReceiveMultiplier 1 -> 3 or higher** on the pendant remains a tolerance experiment. At a 10 ms send
+   period, 3 covers about 30 ms rather than the full observed 110 ms. Ask Julien for his live startup value
+   and test this independently. See ../FRI_RECEIVE_MULTIPLIER_FIX.md.
+3b. **PC-SIDE ESTIMATION (the ace — likely better than the backport)**: the deploy node ALREADY
    computes the wrench from raw external torque PC-side: `wrench_from_external_torque(J, tau_ext)` =
    `pinv(J^T)*tau_ext` (ik.py:94), selectable via `force_source: external_torque` (uses the FRI
    `external_torque` state interface directly, published by the existing lbr_state_broadcaster). This

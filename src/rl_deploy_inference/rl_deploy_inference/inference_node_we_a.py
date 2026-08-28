@@ -208,6 +208,9 @@ class WeAInferenceNode(base.RLDeployInferenceNode):
             return False, "stale/missing: " + ", ".join(missing)
         if self.kinematics is None:
             return False, "kinematics unavailable"
+        fri_problem = self._fri_problem()
+        if fri_problem:
+            return False, "FRI: " + fri_problem
         return True, ""
 
     def _socket_axis_base(self, socket_quat: np.ndarray) -> np.ndarray:
@@ -250,11 +253,12 @@ class WeAInferenceNode(base.RLDeployInferenceNode):
             fingertip_quat,
             self.get_parameter("screw_tip_offset_tcp_xyz").value,
         )
-        force_base = self.force_smoother.update(self._contact_force_base(jac))
+        raw_force_base = self._contact_force_base(jac)
+        force_base = self.force_smoother.update(raw_force_base)
         # ft_bias_base_xyz recreates the uncompensated sim sensor's distal-weight term for the policy.
         # Keep that synthetic load out of real-contact safety and seat thresholds.
         force_bias_base = np.asarray(self.get_parameter("ft_bias_base_xyz").value, dtype=np.float64).reshape(3)
-        contact_force_norm = float(np.linalg.norm(force_base - force_bias_base))
+        contact_force_norm = float(np.linalg.norm(raw_force_base - force_bias_base))
         force_tcp = force_base_to_tcp(force_base, fingertip_quat)
         # Diagnostic ablation: feed zero force to the policy (indices [6:9]) while leaving the real-contact
         # safety norm above untouched. The debug/dump obs then also read zero, confirming the flag is live.
@@ -324,7 +328,14 @@ class WeAInferenceNode(base.RLDeployInferenceNode):
         raw_action = np.clip(self.actor.act(make_actor_obs_we_a(policy, image)), -1.0, 1.0)
         ema = float(self.get_parameter("ema_factor").value)
         action = ema * raw_action + (1.0 - ema) * self.prev_action
-        self.prev_action = action.astype(np.float32)
+        action = base.limit_action_step(
+            action,
+            position_scale_m=float(self.get_parameter("e2e_pos_action_scale").value),
+            rotation_scale_rad=float(self.get_parameter("e2e_rot_action_scale").value),
+            max_position_step_m=float(self.get_parameter("max_policy_position_step_m").value),
+            max_rotation_step_rad=float(self.get_parameter("max_policy_rotation_step_rad").value),
+        )
+        self.prev_action = action.copy()
         target_pos, target_quat, self.yaw_accum_rad = action_to_target_pose_we_a(
             action=action,
             fingertip_pos=fingertip_pos,

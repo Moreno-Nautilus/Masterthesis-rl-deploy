@@ -8,11 +8,13 @@ we proved, what we tried, and what's left. Detailed data + plots live in `deploy
 ---
 
 ## TL;DR
-**The FRI session drops on the FIRST hard CONTACT, every single run, ~1–4 s into the policy —
-killing every insertion attempt before the policy can search/seat.** It is a **robot-side** ~110 ms
-freeze triggered by the contact force transient. With `ReceiveMultiplier = 1` (zero tolerance) the
-session drops instantly. **Every PC-side fix we tried failed. The only remaining fix that addresses
-the real mechanism is raising `ReceiveMultiplier` on the Sunrise pendant.**
+**The FRI session drops on the first substantial contact ramp, killing insertion before the policy can
+search/seat.** The repeated ~110 ms publication gap is now traced to the Humble stack's post-transition
+shutdown path: after FRI has already left `COMMANDING_ACTIVE`, `close_udp_socket()` polls the worker with
+a fixed 100 ms sleep. It is not evidence that a 110 ms network freeze caused the drop. The old bags do
+not identify which side missed the exchange. The strongest actionable difference remains our command
+behavior: direct joint-position streaming, multi-axis requests up to ~7.3 mm, a 42 N cap, smoothed-force
+safety, and no FRI-state/tracking preflight versus Julien's guarded 1 mm q/dq/ddq JTC path.
 
 ---
 
@@ -36,14 +38,16 @@ Crucially: **jitter/POOR appears ONLY at contact** — free-space motion is EXCE
    (25 s, 39 s, 59 s, 75 s…) but ALWAYS at the exact tick contact force steps 0 → 10–12 N. In every
    bag the drop coincides with the run's peak force. Force profile into every drop: ~5 N rest → dips
    ~0 → slams 10–12 N → 110 ms freeze.
-2. **Robot-side freeze, not PC.** At the drop, `/joint_states` (robot→PC) freezes for exactly ~110 ms,
-   AND the FTEstimator wrench freezes with it — but the PC's OUTGOING command stream keeps flowing at
-   200 Hz (5 ms) the whole time. So the PC never stalled; the robot stopped sending.
+2. **The 110 ms gap is shutdown, not root cause.** The FRI system interface blocks its controller-manager
+   read cycle in a fixed 100 ms close poll after detecting the state transition. The 200 Hz command topic
+   is produced by another process upstream of the real FRI UDP loop, so its continuity does not prove the
+   client replied on time or that the robot stopped sending.
 3. **Slow motion, gentle force.** Joint velocity into contact ~0.05 rad/s; physical |F| never exceeds
    ~12 N. It is the force STEP (0→12 N in ~1 tick), not speed or magnitude, that triggers it.
 4. **`ReceiveMultiplier = 1`** (from the pendant FRI config, seen at connect: `SendPeriod 10ms |
-   ReceiveMultiplier 1`) = the client must reply EVERY 10 ms cycle → a 110 ms freeze (~11 missed
-   cycles) = guaranteed drop.
+   ReceiveMultiplier 1`) requires a reply every 10 ms cycle. Because 110 ms is a shutdown artifact,
+   multiplier 3 may provide useful tolerance for an actual one- or two-cycle client delay; packet capture
+   is required before assigning a missed-cycle count.
 5. **Kernel is generic (PREEMPT_DYNAMIC, not PREEMPT_RT)** — but no hung-task/stall/OOM events logged,
    and the PC command stream never gaps, so this is NOT a PC kernel latency spike.
 
@@ -65,17 +69,18 @@ RT/pinning/CPU/estimator-rate. It is the robot's own reaction to the contact for
 
 ---
 
-## The remaining fix (addresses the actual mechanism)
-### ★ ReceiveMultiplier 1 → 3 on the Sunrise pendant  ← THE FIX
+## Pendant tolerance experiment (still useful, not a confirmed root fix)
+### ReceiveMultiplier 1 → 3 or higher on the Sunrise pendant
 In the Sunrise project, `LBRServer_select.java` (or the FRI app config):
 ```java
 friConfiguration.setSendPeriodMilliSec(10);
 friConfiguration.setReceiveMultiplier(1);   // -> change to 3
 ```
 Then **Synchronize** to the controller (Sunrise Workbench, Ubuntu-24.04 / Windows laptop — NOT the
-deploy PC). This lets the FRI session TOLERATE a late command (30 ms window) so the 110 ms contact
-transient no longer drops it. Start at 3; raise to 5 if drops persist. Safe: does not change speed,
-limits, or control mode (still POSITION). Full note: `FRI_RECEIVE_MULTIPLIER_FIX.md`.
+deploy PC). This increases tolerance for late client commands. At a 10 ms send period, multiplier 3
+represents only about 30 ms, so it does **not** arithmetically cover the observed 110 ms gap by itself.
+Record the runtime value, test deliberately, and do not treat this setting as proof of the cause. It does
+not change speed, limits, or control mode. Full note: `FRI_RECEIVE_MULTIPLIER_FIX.md`.
 
 *Blocker:* needs Sunrise Workbench access (whoever set up the FRI app). The deploy engineer does not
 have easy access to change it.
@@ -95,12 +100,19 @@ have easy access to change it.
 
 ---
 
-## Cross-check that would CONFIRM the fix
+## Cross-check completed against Julien's surviving deployment
 Another student (Julien Casalini, repo `assembly_cell_ws`, private — Moreno-Nautilus has access) runs
-FORCE-based insertion on the SAME robot **without** these FRI drops. His FRI/Sunrise config almost
-certainly has `ReceiveMultiplier > 1` (or a different FRI setup). **Cloning and diffing his
-`*_system_config.yaml` + Sunrise settings against ours would confirm the fix and give the exact value
-to use.** Not yet done.
+FORCE-based insertion on the SAME robot **without** these FRI drops. Commit
+`30b2083dbe10b5572346e074bbf7b481a6bac6ef` uses the standard Humble v2.2.3 LBR stack and FRI POSITION
+client command mode. Its Sunrise Java logs `getReceiveMultiplier()` but never calls
+`setReceiveMultiplier(...)`, so the repository does not establish his live value.
+
+The material differences are in deployment behavior: Julien keeps `joint_trajectory_controller` active,
+publishes short q/dq/ddq horizons from a stateful quintic smoother, caps policy Cartesian change to 1 mm
+per tick, checks a 3 mm commissioning envelope, checks raw baseline-subtracted force, and continuously
+requires healthy FRI session/quality/safety/drive/command/overlay/control-mode fields. His diagnostics record
+successful contact while FRI remained COMMANDING_ACTIVE. Our previous procedure switched away from JTC to
+the direct LBR command controller and used a linear 15-to-200 Hz position bridge.
 
 ---
 
@@ -150,11 +162,12 @@ to use.** Not yet done.
 ---
 
 ## Recommended next actions (in order)
-1. **Clone `assembly_cell_ws` and diff his FRI/Sunrise config vs ours** → confirm ReceiveMultiplier is
-   the difference + get his value. (Fast, definitive.)
-2. **Set `ReceiveMultiplier = 3` on the pendant** (Sunrise Workbench), re-sync, retest. Expected to fix.
-3. If pendant is truly inaccessible: try `e2e_pos_action_scale 0.003` and/or `force_source:
-   external_torque` as PC-side long-shots.
+1. Deploy through the new guarded JTC bridge with 1 mm applied steps, 0.5 degree rotation steps,
+   raw-force 15 N abort, 6 N downward attenuation, and fail-closed FRI checks.
+2. Record `/lbr_dual_arm_y_gripper/state`, the JTC trajectory topic, measured joints, raw wrench, and policy
+   targets. Confirm the actual Sunrise `control_mode` before setting `expected_control_mode` to 0 or 1.
+3. Ask Julien for his live Sunrise startup line containing SendPeriod and ReceiveMultiplier. Test a larger
+   multiplier as a separate tolerance experiment if the guarded path still produces the 110 ms gap.
 
 Once the FRI holds through contact, the policy can finally be judged. Prior partial-run behavior
 (from bags, before the drop): descends ~16–25 mm toward the socket, closes goal distance ~40→20 mm,
