@@ -19,7 +19,12 @@ class WeAObsPreprocessConfig:
     frame_stack: int = 1
     ft_smoothing_factor: float = 0.25
     force_noise_std: float = 0.0
-    fov_match: bool = True
+    # fov_match default FALSE (2026-08-31): sim renders native 320x180 16:9 with NO crop
+    # (cooling_iiwa_tasks_cfg.py:574 "Full 16:9 single-frame RGB, downscaled to 320x180 without
+    # cropping"). The real D405 is 848x480 = ALSO 16:9 at ~88deg ~= sim 87.2deg, so a plain resize
+    # matches sim byte-for-geometry. The old center-crop cropped to ~831x467 CENTERED ON cx,cy
+    # (off image-center) -> an off-center shift sim never had, which steered the vision policy wrong.
+    fov_match: bool = False
     sim_focal_length_mm: float = 11.0
     sim_horizontal_aperture_mm: float = 20.955
 

@@ -34,22 +34,21 @@ Crucially: **jitter/POOR appears ONLY at contact** — free-space motion is EXCE
 ---
 
 ## What the data proves (analyzed across 6 deploy rosbags, `deploy_analysis/`)
-1. **Contact-triggered, not time/CPU/periodic.** Drops happen at wildly different times
-   (25 s, 39 s, 59 s, 75 s…) but ALWAYS at the exact tick contact force steps 0 → 10–12 N. In every
-   bag the drop coincides with the run's peak force. Force profile into every drop: ~5 N rest → dips
-   ~0 → slams 10–12 N → 110 ms freeze.
+1. **Contact-correlated, not simply elapsed-time periodic.** Drops happen at different elapsed times,
+   during steep force ramps into roughly 10-12 N. The bags establish correlation, not whether Sunrise
+   motion/safety or an FRI reply deadline initiates the transition.
 2. **The 110 ms gap is shutdown, not root cause.** The FRI system interface blocks its controller-manager
    read cycle in a fixed 100 ms close poll after detecting the state transition. The 200 Hz command topic
    is produced by another process upstream of the real FRI UDP loop, so its continuity does not prove the
    client replied on time or that the robot stopped sending.
-3. **Slow motion, gentle force.** Joint velocity into contact ~0.05 rad/s; physical |F| never exceeds
-   ~12 N. It is the force STEP (0→12 N in ~1 tick), not speed or magnitude, that triggers it.
+3. **Moderate recorded force.** Physical |F| never exceeds roughly 12.5 N. The old open-loop joint
+   state does not support a trustworthy physical tracking/velocity conclusion.
 4. **`ReceiveMultiplier = 1`** (from the pendant FRI config, seen at connect: `SendPeriod 10ms |
    ReceiveMultiplier 1`) requires a reply every 10 ms cycle. Because 110 ms is a shutdown artifact,
    multiplier 3 may provide useful tolerance for an actual one- or two-cycle client delay; packet capture
    is required before assigning a missed-cycle count.
-5. **Kernel is generic (PREEMPT_DYNAMIC, not PREEMPT_RT)** — but no hung-task/stall/OOM events logged,
-   and the PC command stream never gaps, so this is NOT a PC kernel latency spike.
+5. **Kernel is generic (PREEMPT_DYNAMIC, not PREEMPT_RT).** No long whole-PC stall was logged, but the
+   separate ROS command topic cannot rule out a short FRI-thread, UDP, or NIC deadline failure.
 
 ---
 
@@ -64,8 +63,8 @@ Crucially: **jitter/POOR appears ONLY at contact** — free-space motion is EXCE
 | **FTEstimator `update_rate` 100 → 30 Hz** (`lbr_two/one_system_config.yaml`) | CONFIRMED live (26 Hz measured); **STILL drops at contact, identical** |
 | **FTEstimator force/torque thresholds → 0** (parity, sim has no deadband) | No effect on the drop (kept for force-obs parity, see below) |
 
-**Conclusion: the async-FTEstimator-contention theory is DISPROVEN.** The drop is independent of PC
-RT/pinning/CPU/estimator-rate. It is the robot's own reaction to the contact force transient.
+**Conclusion: lowering the async FTEstimator rate is not a sufficient fix.** The existing evidence does
+not identify which side of the real FRI exchange initiates the transition.
 
 ---
 
@@ -77,10 +76,11 @@ friConfiguration.setSendPeriodMilliSec(10);
 friConfiguration.setReceiveMultiplier(1);   // -> change to 3
 ```
 Then **Synchronize** to the controller (Sunrise Workbench, Ubuntu-24.04 / Windows laptop — NOT the
-deploy PC). This increases tolerance for late client commands. At a 10 ms send period, multiplier 3
-represents only about 30 ms, so it does **not** arithmetically cover the observed 110 ms gap by itself.
-Record the runtime value, test deliberately, and do not treat this setting as proof of the cause. It does
-not change speed, limits, or control mode. Full note: `FRI_RECEIVE_MULTIPLIER_FIX.md`.
+deploy PC). This changes the expected reply cadence from 10 ms to 30 ms. The observed 110 ms is a
+post-drop shutdown delay, not a measured pre-drop packet outage, so it no longer argues that multiplier
+3 is too small. Record packets and the runtime value, test deliberately, and do not treat this setting
+as proof of the cause. It does not change speed, limits, or control mode. Full note:
+`FRI_RECEIVE_MULTIPLIER_FIX.md`.
 
 *Blocker:* needs Sunrise Workbench access (whoever set up the FRI app). The deploy engineer does not
 have easy access to change it.
@@ -152,11 +152,12 @@ the direct LBR command controller and used a linear 15-to-200 Hz position bridge
 
 ## Ruled out — do NOT re-chase
 - **Joint ordering** — FINE. `/joint_states` reports a scrambled order `[A1,A3,A5,A2,A6,A4,A7]` but the
-  deploy node maps BY NAME; command goes out A1..A7 which the controller expects; tracking error ~2 mrad.
-  The scramble is cosmetic.
+  deploy node maps BY NAME and command goes out A1..A7. Do not infer physical tracking error from these
+  bags: position mode used `open_loop: true`, which substitutes the filtered command for measured joint
+  position in the published state interface.
 - **Memory leak** — NO (56 Gi free, swap ~0; drops happen in seconds).
-- **PC RT / CPU / jitter** — addressed (SCHED_FIFO 80 + pinning + killed hog); free-space jitter ~0.
-- **Kernel latency spike** — no hung-task/stall events; PC command stream never gaps.
+- **Whole-PC load** — improved with SCHED_FIFO 80, pinning, and removal of the CPU hog. This does not
+  prove the actual FRI UDP thread replied on every 10 ms cycle.
 - **FTEstimator async contention** — DISPROVEN by the 30 Hz test.
 
 ---
@@ -164,10 +165,11 @@ the direct LBR command controller and used a linear 15-to-200 Hz position bridge
 ## Recommended next actions (in order)
 1. Deploy through the new guarded JTC bridge with 1 mm applied steps, 0.5 degree rotation steps,
    raw-force 15 N abort, 6 N downward attenuation, and fail-closed FRI checks.
-2. Record `/lbr_dual_arm_y_gripper/state`, the JTC trajectory topic, measured joints, raw wrench, and policy
-   targets. Confirm the actual Sunrise `control_mode` before setting `expected_control_mode` to 0 or 1.
-3. Ask Julien for his live Sunrise startup line containing SendPeriod and ReceiveMultiplier. Test a larger
-   multiplier as a separate tolerance experiment if the guarded path still produces the 110 ms gap.
+2. Record `/lbr_dual_arm_y_gripper/state`, `/rosout`, the JTC trajectory topic, joint states, raw wrench,
+   and policy targets, plus a packet capture of UDP port 30201. Confirm the actual Sunrise `control_mode`
+   before setting `expected_control_mode` to 0 or 1.
+3. Ask Julien for his live Sunrise startup line containing control mode, SendPeriod, and ReceiveMultiplier.
+   Test multiplier 3 separately if packet timing indicates a late client reply.
 
 Once the FRI holds through contact, the policy can finally be judged. Prior partial-run behavior
 (from bags, before the drop): descends ~16–25 mm toward the socket, closes goal distance ~40→20 mm,

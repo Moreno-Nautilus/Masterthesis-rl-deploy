@@ -65,6 +65,10 @@ class WeAInferenceNode(base.RLDeployInferenceNode):
         self.declare_parameter("we_a_geometry_calibrated", False)
         self.declare_parameter("we_a_axis_guard_deg", 60.0)
         self.declare_parameter("we_a_force_bias_calibrated", False)
+        # A/B DIAGNOSTIC: feed the actor a BLANK (zero) image instead of the live wrist RGB, so the
+        # policy runs on force + socket-anchored goal_delta only. Isolates whether the real wrist view
+        # is STEERING the policy wrong (blank should stop the vision-driven XY drift) vs helping.
+        self.declare_parameter("blank_image", False)
         # Diagnostic: zero the 3 wrist-force channels (policy indices [6:9]) before every actor forward.
         # pdz_overnight trained with a broken gravity-comp baseline (~0.75*gripper_weight bias baked into
         # the force obs), so the real gravity-compensated F/T does not match training. Zeroing removes the
@@ -318,6 +322,8 @@ class WeAInferenceNode(base.RLDeployInferenceNode):
             shaft_axis_tcp_xyz=self.get_parameter("shaft_axis_tcp_xyz").value,
         )
         image = self.frame_stack.push(preprocess_rgb_we_a(self.rgb.value, self.obs_cfg, self.cam_intrinsics))
+        if self.get_parameter("blank_image").value:
+            image = np.zeros_like(image)  # A/B: run on force + anchor only, no wrist vision
         policy = build_policy_vector_we_a(goal_delta, force_tcp, self.prev_action)
         if self.get_parameter("publish_debug_obs").value:
             msg = base.Float32MultiArray()

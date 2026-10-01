@@ -149,6 +149,81 @@ def get_delta_dof_pos(delta_pose: np.ndarray, jacobian: np.ndarray, damping: flo
     return jacobian.T @ np.linalg.solve(jj_t + reg, delta_pose)
 
 
+def get_delta_dof_pos_weighted(
+    delta_pose: np.ndarray,
+    jacobian: np.ndarray,
+    joint_weights: np.ndarray,
+    damping: float = 0.05,
+    q: np.ndarray | None = None,
+    q_rest: np.ndarray | None = None,
+    null_gain: np.ndarray | float = 0.0,
+) -> np.ndarray:
+    """Weighted damped least-squares IK with optional nullspace posture task.
+
+    dq = Winv Jt (J Winv Jt + lambda^2 I)^-1 dx  +  (I - J^# J) k (q_rest - q)
+
+    joint_weights (len n): PER-JOINT COST. High weight = "expensive / avoid moving this joint"
+    for the Cartesian task, so a high weight on A1/A2/A3 stops the shoulder from dominating
+    translation and dragging the TCP down. Winv = diag(1/joint_weights).
+    """
+    delta_pose = np.asarray(delta_pose, dtype=np.float64).reshape(6)
+    jacobian = np.asarray(jacobian, dtype=np.float64)
+    w = np.asarray(joint_weights, dtype=np.float64).reshape(-1)
+    n = jacobian.shape[1]
+    if jacobian.shape[0] != 6:
+        raise ValueError(f"jacobian must have shape (6, n), got {jacobian.shape}")
+
+    winv = np.diag(1.0 / w)                              # (n, n) inverse weight
+    jwjt = jacobian @ winv @ jacobian.T
+    reg = (float(damping) ** 2) * np.eye(6, dtype=np.float64)
+    jwjt_inv = np.linalg.solve(jwjt + reg, np.eye(6))
+    j_sharp = winv @ jacobian.T @ jwjt_inv               # (n, 6) weighted pseudo-inverse
+    dq_task = j_sharp @ delta_pose
+
+    if q is not None and q_rest is not None and np.any(np.asarray(null_gain) != 0.0):
+        q = np.asarray(q, dtype=np.float64).reshape(-1)
+        q_rest = np.asarray(q_rest, dtype=np.float64).reshape(-1)
+        null_proj = np.eye(n) - j_sharp @ jacobian
+        k = np.asarray(null_gain, dtype=np.float64)
+        dq_task = dq_task + null_proj @ (k * (q_rest - q))
+    return dq_task
+
+
+def get_delta_dof_pos_nullspace(
+    delta_pose: np.ndarray,
+    jacobian: np.ndarray,
+    q: np.ndarray,
+    q_rest: np.ndarray,
+    damping: float = 0.05,
+    null_gain: np.ndarray | float = 0.1,
+) -> np.ndarray:
+    """DLS IK with a nullspace posture task that pins the redundant DoF (elbow) toward q_rest.
+
+    dq = J^dls dx + (I - J^dls J) k (q_rest - q)
+
+    The nullspace term is projected so it does not disturb the TCP pose, but resolves the
+    7-DoF redundancy by pulling joints toward a rest posture. Use a per-joint `null_gain`
+    array to weight specific joints harder (e.g. joints 3/4 to stop the elbow collapsing).
+    """
+    delta_pose = np.asarray(delta_pose, dtype=np.float64).reshape(6)
+    jacobian = np.asarray(jacobian, dtype=np.float64)
+    q = np.asarray(q, dtype=np.float64).reshape(-1)
+    q_rest = np.asarray(q_rest, dtype=np.float64).reshape(-1)
+    n = jacobian.shape[1]
+    if jacobian.shape[0] != 6:
+        raise ValueError(f"jacobian must have shape (6, n), got {jacobian.shape}")
+
+    reg = (float(damping) ** 2) * np.eye(6, dtype=np.float64)
+    jj_t_inv = np.linalg.solve(jacobian @ jacobian.T + reg, np.eye(6))
+    j_dls = jacobian.T @ jj_t_inv                       # (n, 6) damped pseudo-inverse
+    dq_task = j_dls @ delta_pose                        # primary Cartesian task
+
+    null_proj = np.eye(n) - j_dls @ jacobian            # (I - J^dls J)
+    k = np.asarray(null_gain, dtype=np.float64)
+    dq_null = null_proj @ (k * (q_rest - q))            # posture bias, TCP-preserving
+    return dq_task + dq_null
+
+
 def action_to_target_pose(
     action: np.ndarray,
     fingertip_pos: np.ndarray,

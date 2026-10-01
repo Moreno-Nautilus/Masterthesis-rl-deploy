@@ -15,20 +15,18 @@ which UDP direction or Sunrise condition initiated the transition.
 
 ## ⚠️ UPDATE 2026-08-28 — FTEstimator theory DISPROVEN by test
 Ran the deploy with FTEstimator at 30 Hz (CONFIRMED live: wrench value-change rate measured 26 Hz in
-bag `pdz_single_30hz_20260828_140335`). **It STILL dropped at contact**, identical signature: 110 ms
-stall at policy tick 18/150, |F| went 4→1→6→12 N into the drop, command stream fine (5 ms) = PC fine,
-robot-side freeze. Force-threshold=0 also applied, no effect. => The async-FTEstimator-contention root
-cause below is WRONG. The drop is a ROBOT-SIDE reaction to the contact force transient, independent of
-PC RT/pinning/CPU/estimator-rate (all tried, none fixed it). Julien's surviving deployment does not set
-ReceiveMultiplier in source; instead it differs materially in command shaping and safety supervision.
-The primary next test is therefore the guarded JTC path, not more estimator tuning.
+bag `pdz_single_30hz_20260828_140335`). **It STILL dropped at contact**, with the same post-transition
+110 ms shutdown signature. Force-threshold=0 also applied, no effect. This disproves estimator rate as
+a sufficient fix, but it does not prove the actual FRI UDP thread met every deadline. Julien's surviving
+deployment differs materially in command shaping, safety supervision, and intended Sunrise control mode.
+The primary next test is the guarded JTC path plus packet capture, not more estimator tuning.
 
 ## Root cause (ORIGINAL THEORY — now disproven, see UPDATE above)
 The async `lbr_fri_ros2::FTEstimator` runs its own thread at update_rate=100 Hz / rt_prio=30, next to
-the FRI send loop (rt_prio=80) on the same PC. It's idle in free motion (forces < 2 N thresholds); at
-contact it computes a damped Jacobian pseudo-inverse EVERY 100 Hz cycle -> contends with the FRI loop
--> the 110 ms hiccup. Upstream (lbr-stack) REMOVED this exact async worker in jazzy-v2.4.0 and replaced
-it with a SYNCHRONOUS WrenchEstimator + EstimatedWrenchInterface chainable controller — for this reason.
+the FRI send loop (rt_prio=80) on the same PC. Source inspection shows it computes the Jacobian
+pseudo-inverse every cycle, including free motion; crossing a force threshold does not turn that work on.
+Upstream later removed the async worker and replaced it with a synchronous WrenchEstimator controller,
+but the release note does not establish our contact-drop mechanism.
 Our stack: humble-v2.2.3, still the async FTEstimator. ros2_control = 2.54.0 (recent; HAS
 ChainableControllerInterface).
 
@@ -38,22 +36,22 @@ ChainableControllerInterface).
 flowing. The policy reads force at 15 Hz, so any estimator rate >= ~20 Hz feeds it fully.
 
 ## Fix ladder (cheap -> expensive) — try in order
-1. **FTEstimator 100 -> 30 Hz** [DONE 2026-08-28, applied, no rebuild — symlink install]. Edited both
+1. **FTEstimator 100 -> 30 Hz** [DONE 2026-08-28, DID NOT FIX DROP]. Edited both
    lbr_two_system_config.yaml (right) and lbr_one_system_config.yaml (left). 30 Hz >> 15 Hz policy,
-   < 100 Hz controller_manager. Keeps force + safety + seat-detect. TEST THIS FIRST.
-   - If still drops: try 20 Hz (still > 15 Hz policy).
+   < 100 Hz controller_manager. Keeps force + safety + seat-detect. Further rate tuning is low priority.
 2. **Guard the deployment command path** [IMPLEMENTED on branch `moreno`]: keep JTC active; publish
    stateful q/dq/ddq quintic horizons; cap applied TCP change to 1 mm/tick and 0.5 deg/tick; use raw
    baseline-subtracted force for the 15 N abort; attenuate downward command toward 6 N; require healthy
    live FRI state before and during policy motion.
-3. **ReceiveMultiplier 1 -> 3 or higher** on the pendant remains a tolerance experiment. At a 10 ms send
-   period, 3 covers about 30 ms rather than the full observed 110 ms. Ask Julien for his live startup value
-   and test this independently. See ../FRI_RECEIVE_MULTIPLIER_FIX.md.
+3. **ReceiveMultiplier 1 -> 3 or higher** on the pendant remains a useful tolerance experiment. At a
+   10 ms send period, multiplier 3 permits the normal reply cadence to be 30 ms. The observed 110 ms is
+   post-drop shutdown and must not be used as the required tolerance. Capture packets, ask Julien for his
+   live startup value, and test this independently. See `FRI_RECEIVE_MULTIPLIER_FIX.md`.
 3b. **PC-SIDE ESTIMATION (the ace — likely better than the backport)**: the deploy node ALREADY
    computes the wrench from raw external torque PC-side: `wrench_from_external_torque(J, tau_ext)` =
    `pinv(J^T)*tau_ext` (ik.py:94), selectable via `force_source: external_torque` (uses the FRI
    `external_torque` state interface directly, published by the existing lbr_state_broadcaster). This
-   BYPASSES the hardware async FTEstimator entirely -> no in-FRI-thread contention -> no contact drop,
+   BYPASSES the hardware async FTEstimator entirely and removes that worker as one variable,
    with ZERO C++/config surgery on the kuka repo. Caveat: validate sign/scale/DC on hardware
    (press-test) and it's NOT gravity-comp'd the same way as the estimator wrench, so re-check the
    force story. Try this if 30/20Hz insufficient, BEFORE any backport.
@@ -81,6 +79,8 @@ flowing. The policy reads force at 15 Hz, so any estimator rate >= ~20 Hz feeds 
 - Joint ordering: FINE (node maps joint_states by name; cmd is A1..A7; tracking err ~2 mrad). The
   "scrambled joint_states order" is cosmetic; NOT a bug.
 - Memory leak: NO (56 Gi free, swap ~0; drops happen in 1-4 s, far too fast for a leak).
-- PC RT/jitter: already fixed (SCHED_FIFO 80 + core pinning + killed a stray Isaac hog); free-motion
-  jitter is ~0. The remaining drop is contact-triggered robot-side, not PC.
-- Kernel latency spike: no hung-task/stall events; PC command stream never gaps.
+- General PC load was reduced (SCHED_FIFO 80 + core pinning + killed a stray Isaac hog), and free-motion
+  behavior improved. This does not prove the actual FRI `ClientApplication::step()` thread met every
+  10 ms reply deadline at contact.
+- A long whole-PC stall is unlikely, but continuity of the separate ROS command publisher does not rule
+  out a short FRI-thread, UDP, NIC, or controller-side timing failure.

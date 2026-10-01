@@ -15,17 +15,24 @@ FRI_STATE_EXPECTED = {
 }
 
 
+_CONTROL_MODE_LABELS = {
+    0: "POSITION_CONTROL",
+    1: "CART_IMP_CONTROL",
+    2: "JOINT_IMP_CONTROL",
+}
+
+
 def fri_state_problem(state: object, expected_control_mode: int) -> str:
     """Return a concise FRI-state mismatch, or an empty string when safe."""
-    if expected_control_mode not in (-1, 0, 1):
+    if expected_control_mode not in (-1, 0, 1, 2):
         return (
-            "expected_control_mode must be -1 (either), 0 (position), "
-            "or 1 (Cartesian impedance)"
+            "expected_control_mode must be -1 (any), 0 (position), "
+            "1 (Cartesian impedance), or 2 (joint impedance)"
         )
 
     expected = dict(FRI_STATE_EXPECTED)
     if expected_control_mode >= 0:
-        label = "POSITION_CONTROL" if expected_control_mode == 0 else "CARTESIAN_IMPEDANCE_CONTROL"
+        label = _CONTROL_MODE_LABELS[expected_control_mode]
         expected["control_mode"] = (expected_control_mode, label)
 
     bad = []

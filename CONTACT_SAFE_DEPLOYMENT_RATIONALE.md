@@ -66,10 +66,10 @@ The bridge carries its planned `q`, `dq`, and `ddq` state from one policy tick i
 | Joint acceleration | 30 deg/s2 |
 | Joint jerk | 300 deg/s3 |
 | Maximum target lead from measured joints | 0.5 deg |
-| Maximum measured-to-planned tracking error | 0.35 deg |
+| Maximum published-state-to-planned tracking error | 0.35 deg |
 | Joint-state maximum age | 50 ms |
 
-The 0.35 degree threshold is close to the largest old direct-command lead, 0.349 degrees. The new smoother should reduce that lead, but this threshold may latch during commissioning. A latch is useful evidence; do not raise it before inspecting the measured and planned trajectories.
+The 0.35 degree threshold is close to the largest old direct-command lead, 0.349 degrees. However, the current position-control hardware profile uses `open_loop: true`; in that mode the LBR stack substitutes its filtered command for measured joint position in the published state interface. Therefore neither the old bag metric nor this bridge check proves physical tracking. Cartesian impedance automatically forces the stack to closed-loop state reporting. If position control is retained, test `open_loop: false` deliberately in T1 before relying on the tracking guard.
 
 ### 3. Bound the physical Cartesian step by vector norm
 
@@ -125,6 +125,40 @@ That may be as important as the ROS command bridge. The ROS parameter `expected_
 
 Do not copy impedance stiffness or tool-load settings blindly. They are robot/tool-specific and belong to Sunrise commissioning.
 
+## Why FRI probably shuts down at contact
+
+The ROS system interface is not initiating the failure. It first observes that Sunrise/FRI has already left `COMMANDING_ACTIVE`, then deliberately shuts down its local FRI worker. There are two credible ways the earlier state transition can happen.
+
+### Leading hypothesis: rigid contact plus open-loop command progression
+
+The current right-arm hardware profile combines:
+
+```yaml
+client_command_mode: position
+open_loop: true
+```
+
+In this mode, `AsyncClient::command()` calls `set_state_open_loop()`, which replaces the state interface's measured joint position with the filtered commanded joint position. This has several consequences:
+
+1. `/joint_states` is not reliable evidence of physical tracking during active position command mode.
+2. The old deployment computes FK and its next target from a virtual robot that appears to follow perfectly.
+3. The local LBR command guard also sees that substituted state, so it cannot detect the true command-to-robot separation caused by a blocked tool.
+4. Sunrise still sees the actual encoders, external torque, and internal motion/safety state.
+
+At contact, the real robot can stop or deflect while the command path continues advancing. With old requested changes of 5.6-7.3 mm and up to 6.8 degrees per policy tick, this can create a rapid physical following/load error in stiff native position control. Sunrise may then leave the commanding phase because of its internal motion/safety handling. The ROS stack observes that transition and produces the 110 ms shutdown signature.
+
+This mechanism explains why the event is repeatably contact-correlated even though ordinary PC load, inference, and force-estimator work also exist in free space. It also explains why Julien's path is materially different: Cartesian impedance absorbs some contact displacement and the LBR client automatically overrides `open_loop` to false in impedance control.
+
+This remains a hypothesis until the final pre-transition `LBRState`, Sunrise message, and packet timing are captured. The exact internal Sunrise condition might be following error, a safety/load condition, or the FRI motion application reacting to an unexpected state.
+
+### Competing hypothesis: FRI reply deadline
+
+With a 10 ms send period and `ReceiveMultiplier=1`, the KUKA client SDK sends a reply for every monitoring packet. A late/missing PC reply, missing controller packet, or packet loss can make Sunrise degrade connection quality and leave `COMMANDING_ACTIVE`. The pendant's `Quality POOR` and jitter report support this possibility.
+
+The old 200 Hz ROS command topic cannot test this hypothesis because it is produced by a separate process before `ros2_control` and `ClientApplication::step()`. Likewise, the 110 ms shutdown delay is not the missing-packet duration. A packet capture is needed to determine which direction becomes late first.
+
+Pure contact-triggered PC computation is less convincing than before. The old asynchronous force estimator computes its Jacobian inverse continuously, not only when force crosses a threshold, and reducing its rate to 30 Hz did not prevent the transition. That does not completely exclude a client-side deadline miss, but it removes the proposed contact-only estimator branch.
+
 ## What changes for deployment
 
 1. Build and source this branch before starting the deployment node.
@@ -155,6 +189,124 @@ are currently ignored by the repository's broad `*.yaml` rule. They contain the 
 The 1 mm/0.5 degree guards do materially alter almost every active action in the failed runs, so the current checkpoint may become slower or fail to finish the task within its old timeout. That is acceptable for the first experiment: the endpoint is "FRI stayed healthy through repeated controlled contact," not insertion success.
 
 For the final policy, retrain or fine-tune with the deployment actuator model after the FRI issue is isolated. Training should include the same vector-norm action limits, 15 Hz action hold, bounded joint/Cartesian response, force-dependent downward attenuation, realistic compliance/control mode, and the same force observation preprocessing used on hardware. Then success rate can be judged without a train/deploy dynamics mismatch.
+
+## How to debug this on Monday
+
+The objective is to identify the event that occurs **before** the ROS stack's 100 ms shutdown wait. Do not use the 110 ms publication gap itself as the cause.
+
+### 1. Record the exact runtime configuration
+
+Before moving, save the Sunrise startup line and check the live state:
+
+```bash
+ros2 topic echo /lbr_dual_arm_y_gripper/state --once
+ros2 control list_controllers -c /lbr_dual_arm_y_gripper/controller_manager
+```
+
+Record these values in the trial note:
+
+- Sunrise native control mode: position or Cartesian impedance.
+- FRI client command mode and overlay type.
+- Send period and receive multiplier.
+- Selected tool/load model and impedance stiffness/damping, if applicable.
+- `open_loop` value from `lbr_two_system_config.yaml`.
+- Active controller and the publishers on its command topic.
+
+Do not change only `expected_control_mode` to make the ROS check pass. It is a verifier, not a Sunrise mode switch.
+
+### 2. Start packet and ROS evidence before contact
+
+In the rosbag terminal, use the command in `PREDEPLOY_pdz_v3_fulltilt_SINGLE.md`; it now includes `/rosout`, `LBRState`, the JTC trajectory, policy command, joint state, and wrench.
+
+In a separate terminal:
+
+```bash
+mkdir -p ~/deploy_bags
+sudo tcpdump -i enp3s0 -s 0 -B 4096 \
+  -w ~/deploy_bags/fri_$(date +%Y%m%d_%H%M%S).pcap 'udp port 30201'
+```
+
+Also save NIC counters before and after the trial:
+
+```bash
+ip -s link show enp3s0
+sudo ethtool -S enp3s0
+```
+
+Capture the complete terminal output from hardware bringup. The useful line is the first FRI state/quality/safety message, not only the later generic `LBR left COMMANDING_ACTIVE` error.
+
+### 3. Baseline with no contact
+
+Run JTC plus the guarded bridge for at least 30 seconds with policy motion disabled. Verify:
+
+- FRI remains `COMMANDING_ACTIVE` and `EXCELLENT`.
+- Controller-to-PC monitoring packets arrive at approximately 10 ms intervals.
+- PC replies follow the configured receive multiplier.
+- No bridge latch or unexpected controller switch occurs.
+
+This establishes the packet timing and thread behavior immediately before adding the contact variable.
+
+### 4. Contact while policy motion is disabled
+
+Using the lab-approved controlled-force procedure, apply repeatable external loads while JTC holds the arm and the policy cannot advance. Start around 2 N and step through approximately 4 N and 6 N. Stop before the historical 9-12.5 N transition range on the first attempt.
+
+- If FRI drops here, the learned action and IK are not required for the failure. Focus on Sunrise mode, open-loop behavior, tool/load configuration, safety state, and FRI packet timing.
+- If FRI survives, commanded approach and command-to-contact interaction become much more likely.
+
+### 5. Conservative policy-contact ladder
+
+For the first moving test, set:
+
+```bash
+ros2 param set /rl_deploy_inference max_policy_position_step_m 0.00025
+ros2 param set /rl_deploy_inference max_policy_rotation_step_rad 0.004363323
+ros2 param set /rl_deploy_inference z_force_limit_n 4.0
+ros2 param set /rl_deploy_inference ft_force_cap_n 10.0
+ros2 param set /rl_deploy_inference trial_timeout_s 3.0
+```
+
+Run at least five controlled contacts at 0.25 mm. If all survive, repeat at 0.5 mm and then 1 mm while keeping every other setting unchanged. Inspect any bridge latch before clearing it.
+
+### 6. Classify the packet trace
+
+Use the rosbag/`rosout` transition time to inspect the same instant in Wireshark or:
+
+```bash
+tcpdump -tttt -nn -r <capture.pcap> 'udp port 30201'
+```
+
+Interpret the first abnormal event:
+
+| First abnormal evidence | Most likely area |
+|---|---|
+| Controller monitoring packets continue, but the PC reply is late/missing | FRI client thread, scheduling, command callback, or PC transmit path |
+| Controller monitoring packets stop first | Sunrise controller, controller transmit path, physical link, or controller-side session handling |
+| Both directions remain timely, then `onStateChange` reports monitoring/safety change | Sunrise motion, control mode, tool/load, or safety reaction rather than network timing |
+| Packet loss/errors appear in NIC counters | NIC, cable, driver, interrupt/coalescing, or network configuration |
+| Only the ROS command topic remains regular | No conclusion about FRI; this is expected from the separate upsampler/bridge process |
+
+### 7. Run one-variable comparisons
+
+After the guarded position-control baseline, compare separately:
+
+1. `ReceiveMultiplier=1` versus `3`, keeping motion and Sunrise control mode unchanged.
+2. Native position control versus the correctly commissioned Cartesian impedance mode, keeping policy limits unchanged.
+3. If position control must remain, `open_loop: true` versus `false` in T1 with conservative motion. This requires hardware restart/reconfiguration and can change controller behavior; do not treat it as a runtime observation parameter.
+
+Cartesian impedance is the most relevant parity test with Julien. Confirm its actual stiffness, damping, tool load, and `control_mode=1` from Sunrise/`LBRState`; do not copy values blindly.
+
+### 8. Evidence required for a conclusion
+
+For each attempt retain:
+
+- Rosbag, pcap, full bringup terminal log, and pendant/Sunrise first error.
+- Exact parameters and control mode.
+- First contact time, force rise, and peak force.
+- First bad FRI packet interval/direction.
+- First FRI state, quality, safety, or drive-state transition.
+- Bridge latch reason and JTC command around contact.
+
+Do not modify the 100 ms socket-close polling sleep as a proposed fix. Shortening it would only make the visible ROS publication gap smaller after FRI had already failed.
 
 ## Next evidence: staged test
 

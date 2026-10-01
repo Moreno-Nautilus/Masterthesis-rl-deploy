@@ -166,6 +166,12 @@ class RLDeployInferenceNode(Node):
         self.mode = MODE_POLICY if self.get_parameter("policy_active_on_start").value else MODE_HOLD
         self._last_status_t = 0.0
         self._obs_dumped = False
+        # Latched hold setpoint. In Cartesian impedance with an uncompensated tool payload the arm
+        # sags; if hold re-commands the live MEASURED position every tick it chases its own droop
+        # (measured drops -> command that -> sag more -> ...). Instead we capture the position ONCE
+        # when hold begins and command that FIXED setpoint, so hold actually holds. Cleared whenever
+        # we leave hold (policy/preinsert start) so the next hold re-latches the fresh position.
+        self._hold_q: np.ndarray | None = None
 
         obs_cfg = self._make_obs_config()
         self.obs_cfg = obs_cfg
@@ -642,6 +648,7 @@ class RLDeployInferenceNode(Node):
             return response
         self.mode = MODE_POLICY
         self.prev_action[:] = 0.0
+        self._hold_q = None  # leaving hold; next hold re-latches a fresh setpoint
         self.seat_detected = False
         self.seat_pub.publish(Bool(data=False))
         self.policy_start_t = time.monotonic()
@@ -666,6 +673,7 @@ class RLDeployInferenceNode(Node):
     def _srv_stop_policy(self, _request, response):
         self.mode = MODE_HOLD
         self.prev_action[:] = 0.0
+        self._hold_q = None  # re-latch the current position as the new fixed hold setpoint
         self.policy_start_t = None
         self.trial_outcome = "stopped"
         self._ft_baseline_pending = False
@@ -694,6 +702,7 @@ class RLDeployInferenceNode(Node):
             return response
         self.mode = MODE_RESET_PREINSERT
         self.prev_action[:] = 0.0
+        self._hold_q = None  # leaving hold; next hold re-latches a fresh setpoint
         self.policy_start_t = None
         self.trial_outcome = "reset_preinsert"
         self._ft_baseline_pending = False
@@ -1127,10 +1136,15 @@ class RLDeployInferenceNode(Node):
         self.command_pub.publish(msg)
 
     def _hold(self, reason: str) -> None:
-        q = self.joint_pos.value
         should_stream = self.get_parameter("stream_hold_when_disabled").value
-        if should_stream and q is not None:
-            self._publish_q(np.asarray(q, dtype=np.float64).reshape(7))
+        # Latch the hold setpoint the first time we enter hold, then keep commanding THAT fixed
+        # target (not the live measured position) so the arm does not chase its own gravity sag.
+        if self._hold_q is None:
+            q = self.joint_pos.value
+            if q is not None:
+                self._hold_q = np.asarray(q, dtype=np.float64).reshape(7).copy()
+        if should_stream and self._hold_q is not None:
+            self._publish_q(self._hold_q)
         self._status("holding: " + reason)
 
     def _status(self, text: str) -> None:
